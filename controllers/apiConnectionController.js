@@ -29,7 +29,7 @@ async function verifyBybitCredentials(apiKey, secretKey, accountType = 'demo') {
         'X-BAPI-TIMESTAMP': timestamp,
         'X-BAPI-RECV-WINDOW': recvWindow
       },
-      timeout: 10000 // 10 second timeout
+      timeout: 15000 // 15 second timeout (Render can be slow)
     });
 
     // Bybit returns retCode 0 on success
@@ -38,7 +38,13 @@ async function verifyBybitCredentials(apiKey, secretKey, accountType = 'demo') {
       data: response.data
     };
   } catch (error) {
-    const errorMsg = error.response?.data?.retMsg || error.message;
+    const errorMsg = error.response?.data?.retMsg || error.message || error.code;
+    logger.info('Bybit verification attempt', {
+      accountType,
+      errorCode: error.code,
+      status: error.response?.status,
+      message: errorMsg
+    });
     return {
       valid: false,
       error: errorMsg,
