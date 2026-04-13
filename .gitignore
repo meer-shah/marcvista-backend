@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Environment files — never commit secrets
+.env
+.env.local
+.env.production
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+logs/
+server.log
+backend.log
+mongodb.log*
+
+# Runtime / process files
+*.pid
+*.pid.lock
+
+# Local MongoDB data
+data/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Editor
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
