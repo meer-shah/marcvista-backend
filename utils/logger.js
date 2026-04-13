@@ -41,7 +41,9 @@ const logger = {
     if (error?.code !== undefined)   safe.code   = error.code;
     if (error?.name)                 safe.type   = error.name;
     if (error?.status !== undefined) safe.status = error.status;
-    // Deliberately omit: error.message, error.stack, error.response, request data
+    // Temporarily include error message for debugging
+    if (error?.message)              safe.message = error.message;
+    // Deliberately omit: error.stack, error.response, request data
     emit('error', message, safe);
   },
 };
