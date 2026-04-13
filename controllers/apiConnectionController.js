@@ -39,11 +39,14 @@ async function verifyBybitCredentials(apiKey, secretKey, accountType = 'demo') {
     };
   } catch (error) {
     const errorMsg = error.response?.data?.retMsg || error.message || error.code;
-    logger.info('Bybit verification attempt', {
+    logger.info('Bybit verification failed', {
       accountType,
+      baseUrl,
       errorCode: error.code,
       status: error.response?.status,
-      message: errorMsg
+      message: errorMsg,
+      retCode: error.response?.data?.retCode,
+      responseData: error.response?.data
     });
     return {
       valid: false,

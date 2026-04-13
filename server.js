@@ -38,7 +38,7 @@ if (process.env.SENTRY_DSN) {
 const app = express();
 const isProduction = process.env.NODE_ENV === 'production';
 
-app.enable('trust proxy');
+app.set('trust proxy', 1); // Trust only the first proxy (Render's load balancer)
 
 // Security headers
 app.use(helmet({
