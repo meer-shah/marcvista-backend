@@ -187,6 +187,8 @@ const getClosedPnlf = async (req, res) => {
     let trades = response?.result?.list || [];
 
     // Transform trades to match frontend expectations
+    // side is reversed because Bybit returns the closing order's side;
+    // we display the original (opening) order's side instead.
     trades = trades.map(trade => ({
       symbol: trade.symbol,
       size: trade.qty,
@@ -195,7 +197,7 @@ const getClosedPnlf = async (req, res) => {
       exitPrice: trade.avgExitPrice,
       pnl: trade.closedPnl,
       profit: trade.closedPnl,
-      side: trade.side,
+      side: trade.side === 'Buy' ? 'Sell' : 'Buy',
       closedAt: trade.updatedTime || trade.closedAt,
       updatedAt: trade.updatedTime,
       ...trade
@@ -288,6 +290,8 @@ const getPortfolioSummary = async (req, res) => {
     const trades = pnlRes?.result?.list || [];
 
     // Transform trades
+    // side is reversed because Bybit returns the closing order's side;
+    // we display the original (opening) order's side instead.
     const transformedTrades = trades.map(trade => ({
       symbol: trade.symbol,
       size: trade.qty,
@@ -296,7 +300,7 @@ const getPortfolioSummary = async (req, res) => {
       exitPrice: trade.avgExitPrice,
       pnl: trade.closedPnl,
       profit: trade.closedPnl,
-      side: trade.side,
+      side: trade.side === 'Buy' ? 'Sell' : 'Buy',
       closedAt: trade.updatedTime || trade.closedAt,
       updatedAt: trade.updatedTime,
       ...trade
