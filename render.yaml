@@ -28,9 +28,6 @@ services:
       # Optional — leave blank to disable Sentry
       - key: SENTRY_DSN
         sync: false
-      # Optional — leave blank if not using Redis (server falls back gracefully)
-      - key: REDIS_URL
-        sync: false
       # Optional — for password reset emails
       - key: EMAIL_HOST
         sync: false

@@ -189,6 +189,7 @@ const getClosedPnlf = async (req, res) => {
     // Transform trades to match frontend expectations
     // side is reversed because Bybit returns the closing order's side;
     // we display the original (opening) order's side instead.
+    // NOTE: side override must come AFTER ...trade so the spread doesn't overwrite it.
     trades = trades.map(trade => ({
       symbol: trade.symbol,
       size: trade.qty,
@@ -197,10 +198,10 @@ const getClosedPnlf = async (req, res) => {
       exitPrice: trade.avgExitPrice,
       pnl: trade.closedPnl,
       profit: trade.closedPnl,
-      side: trade.side === 'Buy' ? 'Sell' : 'Buy',
       closedAt: trade.updatedTime || trade.closedAt,
       updatedAt: trade.updatedTime,
-      ...trade
+      ...trade,
+      side: trade.side === 'Buy' ? 'Sell' : 'Buy',
     }));
 
     const metrics = calculateTradeMetrics(trades);
@@ -292,6 +293,7 @@ const getPortfolioSummary = async (req, res) => {
     // Transform trades
     // side is reversed because Bybit returns the closing order's side;
     // we display the original (opening) order's side instead.
+    // NOTE: side override must come AFTER ...trade so the spread doesn't overwrite it.
     const transformedTrades = trades.map(trade => ({
       symbol: trade.symbol,
       size: trade.qty,
@@ -300,10 +302,10 @@ const getPortfolioSummary = async (req, res) => {
       exitPrice: trade.avgExitPrice,
       pnl: trade.closedPnl,
       profit: trade.closedPnl,
-      side: trade.side === 'Buy' ? 'Sell' : 'Buy',
       closedAt: trade.updatedTime || trade.closedAt,
       updatedAt: trade.updatedTime,
-      ...trade
+      ...trade,
+      side: trade.side === 'Buy' ? 'Sell' : 'Buy',
     }));
 
     const metrics = calculateTradeMetrics(transformedTrades);

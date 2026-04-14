@@ -5,7 +5,7 @@ const logger = require('./utils/logger');
 const cors = require('cors');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
-const csurf = require('csurf');
+const { csrfMiddleware } = require('./utils/csrf');
 const mongoose = require('mongoose');
 const riskProfileRoutes = require('./routes/riskprofiles');
 const orderRoutes = require('./routes/order');
@@ -82,16 +82,8 @@ app.use((req, res, next) => {
 });
 app.use(cookieParser());
 
-// CSRF protection for state-changing requests
-const csrfProtection = csurf({
-  cookie: {
-    httpOnly: true,
-    secure: isProduction,
-    // Must match auth cookie SameSite: cross-domain deployments require 'none' + Secure.
-    sameSite: isProduction ? 'none' : 'strict',
-  },
-});
-app.use(csrfProtection);
+// CSRF protection — stateless HMAC (see utils/csrf.js for rationale)
+app.use(csrfMiddleware);
 
 // Request logging
 app.use((req, _res, next) => {
@@ -99,8 +91,7 @@ app.use((req, _res, next) => {
   next();
 });
 
-// Health / readiness probes (no auth, no CSRF — must be above csrfProtection middleware
-// or exempted, but since they are GET requests csurf skips them automatically)
+// Health / readiness probes (no auth, no CSRF — skipped automatically for GET)
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -124,9 +115,6 @@ app.use('/api/news', newsRoutes);
 
 // Global error handler — never leak internal error details to the client
 app.use((err, req, res, next) => {
-  if (err.code === 'EBADCSRFTOKEN') {
-    return res.status(403).json({ message: 'Invalid CSRF token.' });
-  }
   // Forward unhandled errors to Sentry before responding
   if (process.env.SENTRY_DSN) {
     Sentry.captureException(err);
@@ -157,11 +145,9 @@ mongoose.connect(process.env.MONGO_URI, {
     process.exit(1);
   });
 
-// Graceful shutdown — close Redis + Mongoose cleanly
-const { disconnectRedis } = require('./config/redisClient');
+// Graceful shutdown — close Mongoose cleanly
 const shutdown = async (signal) => {
   logger.info('shutdown signal received', { signal });
-  await disconnectRedis();
   await mongoose.disconnect();
   process.exit(0);
 };

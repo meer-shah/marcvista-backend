@@ -3,14 +3,14 @@ const axios = require('axios');
 const ApiConnection = require('../models/ApiConnection');
 const { decrypt } = require('./encryption');
 const logger = require('../utils/logger');
-const { getRedisClient } = require('./redisClient');
 
 // ── Cache configuration ─────────────────────────────────────────────────────
-const CREDENTIAL_CACHE_DURATION = 60; // seconds (used by both Redis TTL and in-memory)
+// Single-process in-memory cache. Redis was removed because it was unreachable
+// on our deploy target and every request was paying a reconnect penalty — the
+// in-memory fallback already handled missed lookups, so Redis was pure overhead.
+const CREDENTIAL_CACHE_DURATION_MS = 60 * 1000; // 60 seconds
 
-// In-memory fallback — used only when Redis is unavailable
-let memoryCache = {};
-let memoryCacheTimestamp = {};
+const memoryCache = new Map(); // key -> { credentials, expiresAt }
 
 /**
  * Get Bybit API base URL from environment
@@ -25,39 +25,22 @@ function getBaseUrl() {
 }
 
 /**
- * Fetch API credentials from database with caching (user-specific).
+ * Fetch API credentials from database with in-memory caching (user-specific).
  * Decrypts stored keys before returning them.
- *
- * Cache priority: Redis → in-memory fallback → database.
  */
 async function getCredentials(userId) {
   const cacheKey = `cred:${userId || 'global'}`;
-
-  // ── 1. Try Redis ──────────────────────────────────────────────────────────
-  try {
-    const redis = await getRedisClient();
-    if (redis) {
-      const cached = await redis.get(cacheKey);
-      if (cached) {
-        return JSON.parse(cached);
-      }
-    }
-  } catch {
-    // Redis read failed — continue to fallback
-  }
-
-  // ── 2. Try in-memory fallback ─────────────────────────────────────────────
   const now = Date.now();
-  if (memoryCache[cacheKey] && (now - (memoryCacheTimestamp[cacheKey] || 0)) < CREDENTIAL_CACHE_DURATION * 1000) {
-    return memoryCache[cacheKey];
+
+  const cached = memoryCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return cached.credentials;
   }
 
-  // ── 3. Fetch from database ────────────────────────────────────────────────
   let connection;
   if (userId) {
     connection = await ApiConnection.findOne({ user: userId });
   } else {
-    // Fallback for backward compatibility (no userId provided)
     connection = await ApiConnection.findOne();
   }
 
@@ -71,18 +54,10 @@ async function getCredentials(userId) {
     accountType: connection.accountType || 'demo'
   };
 
-  // ── 4. Write-through: persist to Redis (best-effort) then in-memory ───────
-  try {
-    const redis = await getRedisClient();
-    if (redis) {
-      await redis.setEx(cacheKey, CREDENTIAL_CACHE_DURATION, JSON.stringify(credentials));
-    }
-  } catch {
-    // Redis write failed — no-op, in-memory will cover us
-  }
-
-  memoryCache[cacheKey] = credentials;
-  memoryCacheTimestamp[cacheKey] = now;
+  memoryCache.set(cacheKey, {
+    credentials,
+    expiresAt: now + CREDENTIAL_CACHE_DURATION_MS,
+  });
   return credentials;
 }
 
@@ -151,26 +126,9 @@ async function http_request(endpoint, method, data, Info, userId = null) {
 
 /**
  * Clear credential cache (call after credentials are updated or deleted).
- * Flushes both Redis keys and in-memory fallback.
  */
 async function clearCredentialCache() {
-  // Flush in-memory
-  memoryCache = {};
-  memoryCacheTimestamp = {};
-
-  // Flush Redis keys (best-effort)
-  try {
-    const redis = await getRedisClient();
-    if (redis) {
-      // Delete all credential keys
-      const keys = await redis.keys('cred:*');
-      if (keys.length > 0) {
-        await redis.del(keys);
-      }
-    }
-  } catch {
-    // Redis flush failed — in-memory is already cleared
-  }
+  memoryCache.clear();
 }
 
 module.exports = {

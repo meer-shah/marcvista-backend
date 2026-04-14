@@ -8,13 +8,14 @@ const { validateBody } = require('../middleware/validate');
 const { registerSchema, loginSchema } = require('../validators/schemas');
 const logger = require('../utils/logger');
 const { writeAuditLog } = require('../utils/audit');
+const { generateToken: generateCsrfToken } = require('../utils/csrf');
 
 const isProduction = process.env.NODE_ENV === 'production';
 const authCookieOptions = {
   httpOnly: true,
   secure: isProduction,
   // 'none' required for cross-domain deployments (frontend on Vercel, backend on Render etc.)
-  // Safe because csurf token middleware provides CSRF protection independently.
+  // CSRF protection is provided independently by a stateless HMAC token (see utils/csrf.js).
   // In dev, 'strict' is fine since both run on localhost.
   sameSite: isProduction ? 'none' : 'strict',
   path: '/',
@@ -31,7 +32,7 @@ const authLimiter = rateLimit({
 });
 
 router.get('/csrf-token', (req, res) => {
-  res.json({ csrfToken: req.csrfToken() });
+  res.json({ csrfToken: generateCsrfToken() });
 });
 
 // Register new user
