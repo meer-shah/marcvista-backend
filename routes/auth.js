@@ -76,8 +76,11 @@ router.post('/register', authLimiter, validateBody(registerSchema), async (req, 
 
     writeAuditLog({ event: 'register', userId: user._id, metadata: { email: user.email }, req });
 
+    // Token also returned in body as Bearer fallback for clients where
+    // cross-domain cookies are blocked (iOS Safari ITP).
     res.status(201).json({
       message: 'User registered successfully.',
+      token,
       user: {
         id: user._id,
         email: user.email,
@@ -115,8 +118,11 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
 
     writeAuditLog({ event: 'login.success', userId: user._id, req });
 
+    // Token also returned in body as Bearer fallback for clients where
+    // cross-domain cookies are blocked (iOS Safari ITP).
     res.json({
       message: 'Login successful.',
+      token,
       user: {
         id: user._id,
         email: user.email,
