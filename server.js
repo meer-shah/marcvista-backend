@@ -66,6 +66,7 @@ app.use(helmet({
         preload: true,
       }
     : false,
+  crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
 // Enforce HTTPS in production
@@ -78,26 +79,30 @@ app.use((req, res, next) => {
 
 // CORS — restrict to known frontend origins
 const allowedOrigins = process.env.FRONTEND_URL
-  ? process.env.FRONTEND_URL.split(',').map(o => o.trim())
+  ? process.env.FRONTEND_URL.split(',').map(o => o.trim().replace(/\/$/, ''))
   : (isProduction ? [] : ['http://localhost:8080', 'http://localhost:8081', 'http://localhost:5173', 'http://localhost:3000']);
 
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
     // Allow requests with no origin (e.g. server-to-server, Postman)
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (!origin) return callback(null, true);
+    
+    const normalizedOrigin = origin.replace(/\/$/, '');
+    if (allowedOrigins.includes(normalizedOrigin)) {
       return callback(null, true);
     }
-    // Instead of throwing an error, we just pass false to the callback.
-    // This prevents the server from returning 500/502 and crashing the preflight.
-    // The browser will still block the request if the origin is not allowed.
-    logger.warn('CORS blocked origin', { origin });
+    
+    logger.warn('CORS blocked origin', { origin: normalizedOrigin });
     callback(null, false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-Requested-With', 'Accept'],
   exposedHeaders: ['X-CSRF-Token']
-}));
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // Handle all preflight requests explicitly
 
 // Body parsing — 10kb for most routes; profile route accepts up to 3mb for base64 images
 app.use((req, res, next) => {
