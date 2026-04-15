@@ -37,12 +37,7 @@ if (missingVars.length > 0) {
 // Strict production checks
 if (process.env.NODE_ENV === 'production') {
   if (!process.env.FRONTEND_URL) {
-    console.error(JSON.stringify({ 
-      level: 'error', 
-      timestamp: new Date().toISOString(), 
-      message: 'FRONTEND_URL must be set in production environment' 
-    }));
-    process.exit(1);
+    logger.warn('FRONTEND_URL is not set. All CORS requests from browsers will be blocked in production.');
   }
 }
 
@@ -92,9 +87,16 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
-    callback(new Error(`CORS policy: origin ${origin} is not allowed`));
+    // Instead of throwing an error, we just pass false to the callback.
+    // This prevents the server from returning 500/502 and crashing the preflight.
+    // The browser will still block the request if the origin is not allowed.
+    logger.warn('CORS blocked origin', { origin });
+    callback(null, false);
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-Requested-With', 'Accept'],
+  exposedHeaders: ['X-CSRF-Token']
 }));
 
 // Body parsing — 10kb for most routes; profile route accepts up to 3mb for base64 images

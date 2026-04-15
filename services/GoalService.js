@@ -59,7 +59,8 @@ class GoalService {
         '/v5/position/closed-pnl',
         'GET',
         'category=linear',
-        'Get Closed PnL for Goal Progress'
+        'Get Closed PnL for Goal Progress',
+        userId
       );
       allTrades = pnlResponse?.result?.list || [];
     } catch (error) {
