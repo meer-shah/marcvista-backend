@@ -62,10 +62,12 @@ class OrderService {
    * Place an order with active risk profile calculations applied.
    * Validates R:R, calculates position size from USDT balance, updates risk state.
    */
-  async placeOrderWithRiskProfile(userId, data) {
+  async placeOrderWithRiskProfile(userId, data, riskProfile = null) {
     try {
-      // 1. Fetch active risk profile for this user
-      let riskProfile = await RiskProfile.findOne({ user: userId, ison: true });
+      // 1. Use passed-in risk profile if available (avoids duplicate DB read from controller)
+      if (!riskProfile) {
+        riskProfile = await RiskProfile.findOne({ user: userId, ison: true });
+      }
       if (!riskProfile) this._throwError('No active risk profile found.');
 
       // 2. Validate adjustedRisk and lastTradeResult
@@ -89,13 +91,13 @@ class OrderService {
         this._throwError(`Risk-to-reward ratio ${riskRewardRatio.toFixed(2)} is less than minimum required ${minRiskRewardRatio}`);
       }
 
-      // 4. Fetch USDT balance
-      const accountBalanceResponse = await this.broker.getBalance(userId, 'accountType=UNIFIED');
+      // 4 & 5. Fetch USDT balance and ticker precision in parallel (independent calls)
+      const [accountBalanceResponse, tickerInfo] = await Promise.all([
+        this.broker.getBalance(userId, 'accountType=UNIFIED'),
+        this.broker.getTicker(data.symbol),
+      ]);
       const usdtBalance = getUsdtBalance(accountBalanceResponse);
       if (usdtBalance <= 0) this._throwError('Insufficient USDT balance.');
-
-      // 5. Get ticker precision
-      const tickerInfo = await this.broker.getTicker(data.symbol);
       if (!tickerInfo) this._throwError(`Ticker information not found for symbol ${data.symbol}`);
       const bid1Size = parseFloat(tickerInfo.bid1Size);
       if (isNaN(bid1Size)) this._throwError(`Invalid bid1Size for symbol ${data.symbol}: ${bid1Size}`);

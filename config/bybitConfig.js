@@ -93,6 +93,7 @@ async function http_request(endpoint, method, data, Info, userId = null) {
     const config = {
       method,
       url: fullUrl,
+      timeout: 8000,
       headers: {
         'X-BAPI-SIGN': signature,
         'X-BAPI-API-KEY': apiKey,

@@ -76,7 +76,7 @@ class BybitBroker {
    */
   async getTicker(symbol) {
     const baseUrl = getBaseUrl();
-    const response = await axios.get(`${baseUrl}/v5/market/tickers?category=linear&symbol=${symbol}`);
+    const response = await axios.get(`${baseUrl}/v5/market/tickers?category=linear&symbol=${symbol}`, { timeout: 5000 });
     return response.data?.result?.list?.[0] || null;
   }
 }

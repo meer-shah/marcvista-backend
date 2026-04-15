@@ -32,7 +32,7 @@ const placeOrder = async (req, res) => {
             if (!['Win', 'Loss', null].includes(data.lastTradeResult)) {
                 return res.status(400).json({ error: 'lastTradeResult must be Win, Loss, or null' });
             }
-            await orderService.placeOrderWithRiskProfile(req.user._id, data);
+            await orderService.placeOrderWithRiskProfile(req.user._id, data, riskProfile);
             writeAuditLog({ event: 'order.placed', userId: req.user._id, metadata: { symbol: data.symbol, side: data.side, type: 'risk_profile' }, req });
             return res.status(200).json({ message: "Order placed with risk profile" });
         }
