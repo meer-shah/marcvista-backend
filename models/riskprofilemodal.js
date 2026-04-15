@@ -55,6 +55,18 @@ const riskProfileSchema = new Schema({
   default: {
     type: Boolean,
     default: false,
+  },
+  lastProcessedTradeId: {
+    type: String, // Bybit trade/order ID
+    default: null,
+  },
+  isFirstTrade: {
+    type: Boolean,
+    default: true, // True when profile is first activated; set to false after first order is placed
+  },
+  activatedAt: {
+    type: Date,
+    default: null, // Timestamp of last activation — only trades after this are counted
   }
 });
 

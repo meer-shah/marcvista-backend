@@ -1,5 +1,9 @@
 const express = require('express');
-require('dotenv').config();
+const path = require('path');
+
+// Environment separation: load .env.development if NODE_ENV is not set or is development
+const envFile = process.env.NODE_ENV === 'production' ? '.env' : '.env.development';
+require('dotenv').config({ path: path.join(__dirname, envFile) });
 const Sentry = require('@sentry/node');
 const logger = require('./utils/logger');
 const cors = require('cors');
@@ -18,10 +22,28 @@ const newsRoutes = require('./routes/news');
 // Validate required environment variables before starting
 const requiredEnvVars = ['JWT_SECRET', 'ENCRYPTION_KEY', 'MONGO_URI', 'PORT'];
 const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+
 if (missingVars.length > 0) {
-  // logger not yet initialised here, so use console.error directly
-  console.error(JSON.stringify({ level: 'error', timestamp: new Date().toISOString(), message: 'Missing required environment variables', vars: missingVars }));
+  console.error(JSON.stringify({ 
+    level: 'error', 
+    timestamp: new Date().toISOString(), 
+    message: 'Missing required environment variables', 
+    vars: missingVars,
+    hint: `Ensure ${envFile} exists and contains these variables.`
+  }));
   process.exit(1);
+}
+
+// Strict production checks
+if (process.env.NODE_ENV === 'production') {
+  if (!process.env.FRONTEND_URL) {
+    console.error(JSON.stringify({ 
+      level: 'error', 
+      timestamp: new Date().toISOString(), 
+      message: 'FRONTEND_URL must be set in production environment' 
+    }));
+    process.exit(1);
+  }
 }
 
 // Sentry — must be initialised before any other middleware or routes.
@@ -62,7 +84,7 @@ app.use((req, res, next) => {
 // CORS — restrict to known frontend origins
 const allowedOrigins = process.env.FRONTEND_URL
   ? process.env.FRONTEND_URL.split(',').map(o => o.trim())
-  : ['http://localhost:8080', 'http://localhost:8081', 'http://localhost:5173', 'http://localhost:3000'];
+  : (isProduction ? [] : ['http://localhost:8080', 'http://localhost:8081', 'http://localhost:5173', 'http://localhost:3000']);
 
 app.use(cors({
   origin: (origin, callback) => {

@@ -208,6 +208,65 @@ const getClosedPnlf = async (req, res) => {
     const { bestTrade, worstTrade } = findBestAndWorstTrade(trades);
     const { bestCoins, worstCoins } = analyzeCoinPerformance(trades);
 
+    // Sync Risk Profile counters proactively for ALL unprocessed trades (in chronological order).
+    // Bybit returns trades newest-first. We reverse to process oldest-first so streak counters
+    // and the reset point fire in the correct sequence even if multiple trades closed between polls.
+    // ONLY trades executed AFTER the profile's activatedAt timestamp are counted.
+    if (trades.length > 0) {
+      const RiskProfileService = require('../services/RiskProfileService');
+      const riskProfileService = new RiskProfileService();
+      const RiskProfile = require('../models/riskprofilemodal');
+
+      try {
+        const activeProfile = await RiskProfile.findOne({ user: req.user._id, ison: true });
+
+        if (activeProfile) {
+          // Use a 5-second buffer (5000ms) to account for clock skew/timing differences
+          const activatedAt = (activeProfile.activatedAt ? new Date(activeProfile.activatedAt).getTime() : 0) - 5000;
+
+          // Reverse to get oldest-first order
+          const tradesChronological = [...trades].reverse();
+
+          // Filter: only trades that closed AFTER the profile was activated (with 5s buffer)
+          const tradesAfterActivation = tradesChronological.filter(t => {
+            const closedTime = Number(t.updatedTime || t.updatedAt || t.closedAt || 0);
+            return closedTime >= activatedAt;
+          });
+
+          // Find where we left off last time within the post-activation trades
+          const lastProcessedIdx = activeProfile.lastProcessedTradeId
+            ? tradesAfterActivation.findIndex(t => {
+                const id = t.orderId || t.execId || t.closedAt || t.updatedAt;
+                return String(id) === activeProfile.lastProcessedTradeId;
+              })
+            : -1;
+
+          // Process every trade that came AFTER the last processed one
+          const unprocessedTrades = tradesAfterActivation.slice(lastProcessedIdx + 1);
+
+          for (const trade of unprocessedTrades) {
+            const pnl = parseFloat(trade.closedPnl);
+            if (isNaN(pnl)) {
+              logger.warn('Skipping trade sync: invalid PnL', { tradeId: trade.orderId || trade.execId });
+              continue;
+            }
+            const result = pnl > 0 ? 'Win' : 'Loss';
+            const tradeId = trade.orderId || trade.execId || trade.closedAt || trade.updatedAt;
+            if (!tradeId) {
+              logger.warn('Skipping trade sync: no valid tradeId');
+              continue;
+            }
+            
+            logger.info('Proactive syncing trade result', { tradeId, result });
+            await riskProfileService.processNewTradeResult(req.user._id, result, String(tradeId));
+          }
+        }
+      } catch (syncError) {
+        logger.error('Proactive Risk Sync Error:', syncError);
+        // Never block the response even if sync fails
+      }
+    }
+
     res.json({
       trades,
       metrics,

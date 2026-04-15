@@ -65,7 +65,7 @@ class OrderService {
   async placeOrderWithRiskProfile(userId, data) {
     try {
       // 1. Fetch active risk profile for this user
-      const riskProfile = await RiskProfile.findOne({ user: userId, ison: true });
+      let riskProfile = await RiskProfile.findOne({ user: userId, ison: true });
       if (!riskProfile) this._throwError('No active risk profile found.');
 
       // 2. Validate adjustedRisk and lastTradeResult
@@ -76,12 +76,14 @@ class OrderService {
         this._throwError(`Invalid lastTradeResult: ${data.lastTradeResult}`);
       }
 
-      // 3. Validate R:R
+      // 3. Validate R:R (use absolute values so it works for both Long and Short)
       const { takeProfit, stopLoss, price } = data;
       if (!takeProfit || !stopLoss || !price) {
         this._throwError('Missing takeProfit, stopLoss, or price');
       }
-      const riskRewardRatio = (takeProfit - price) / (price - stopLoss);
+      const reward = Math.abs(parseFloat(takeProfit) - parseFloat(price));
+      const risk   = Math.abs(parseFloat(price) - parseFloat(stopLoss));
+      const riskRewardRatio = risk > 0 ? reward / risk : 0;
       const minRiskRewardRatio = riskProfile.minRiskRewardRatio || 1;
       if (riskRewardRatio < minRiskRewardRatio) {
         this._throwError(`Risk-to-reward ratio ${riskRewardRatio.toFixed(2)} is less than minimum required ${minRiskRewardRatio}`);
@@ -99,37 +101,46 @@ class OrderService {
       if (isNaN(bid1Size)) this._throwError(`Invalid bid1Size for symbol ${data.symbol}: ${bid1Size}`);
       const precision = (bid1Size.toString().split('.')[1] || '').length;
 
-      // 6. Calculate position size
+      // 6. Update risk profile state using centralized service logic
+      // This handles streak tracking, reset logic, and double-counting prevention (via lastTradeId)
+      const RiskProfileService = require('./RiskProfileService');
+      const riskProfileService = new RiskProfileService();
+      
+      if (data.lastTradeResult && data.lastTradeId && !riskProfile.isFirstTrade) {
+        logger.info('Processing last trade result before placement', { lastTradeResult: data.lastTradeResult, lastTradeId: data.lastTradeId });
+        await riskProfileService.processNewTradeResult(userId, data.lastTradeResult, data.lastTradeId);
+        
+        // Re-fetch the risk profile to get updated values for position sizing
+        const updatedProfile = await RiskProfile.findOne({ user: userId, ison: true });
+        if (updatedProfile) {
+          logger.info('Risk profile updated after results processing', { 
+            currentRisk: updatedProfile.currentrisk, 
+            losses: updatedProfile.consecutiveLosses,
+            isFirstTrade: updatedProfile.isFirstTrade
+          });
+          riskProfile = updatedProfile;
+          // Important: We use the UPDATED risk profile values for the quantity calculation
+          data.adjustedRisk = riskProfile.currentrisk;
+        }
+      }
+
+      // Mark first trade as consumed — subsequent orders will use compounding logic
+      if (riskProfile.isFirstTrade) {
+        riskProfile.isFirstTrade = false;
+        await riskProfile.save();
+        // Use the initial risk for position sizing on first trade
+        data.adjustedRisk = riskProfile.currentrisk;
+      }
+
+      // 7. Calculate position size using final adjustedRisk
       const orderPrice = parseFloat(price);
       const stopLossPrice = parseFloat(stopLoss);
       const riskPerUnit = Math.abs(orderPrice - stopLossPrice);
       if (riskPerUnit <= 0) this._throwError('Stop loss must differ from entry price');
+      
       const riskAmount = (data.adjustedRisk / 100) * usdtBalance;
       const newQty = (riskAmount / riskPerUnit).toFixed(precision);
       if (parseFloat(newQty) <= 0) this._throwError('Calculated order quantity is zero or negative');
-
-      // 7. Update risk profile state
-      const originalCurrentRisk = riskProfile.currentrisk || 0;
-      const reset = riskProfile.reset || 10000;
-      if ((riskProfile.consecutiveWins || 0) >= reset || (riskProfile.consecutiveLosses || 0) >= reset) {
-        riskProfile.consecutiveWins = 0;
-        riskProfile.consecutiveLosses = 0;
-      }
-      const isFirstTrade = (riskProfile.consecutiveWins === 0 && riskProfile.consecutiveLosses === 0);
-
-      riskProfile.previousrisk = originalCurrentRisk;
-      riskProfile.currentrisk = data.adjustedRisk;
-
-      if (!isFirstTrade && data.lastTradeResult) {
-        if (data.lastTradeResult === 'Win') {
-          riskProfile.consecutiveWins = (riskProfile.consecutiveWins || 0) + 1;
-          riskProfile.consecutiveLosses = 0;
-        } else if (data.lastTradeResult === 'Loss') {
-          riskProfile.consecutiveLosses = (riskProfile.consecutiveLosses || 0) + 1;
-          riskProfile.consecutiveWins = 0;
-        }
-      }
-      await riskProfile.save();
 
       // 8. Prepare clean order data for Bybit
       const formatEnum = (str) => str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
@@ -155,7 +166,10 @@ class OrderService {
   }
 
   /**
-   * Cancel an order and roll back risk profile state.
+   * Cancel an order.
+   * Cancelling a pending order means NO trade was executed, so risk state must NOT change.
+   * Exception: if this was the very first order (no wins/losses yet), reset isFirstTrade = true
+   * so the user gets fresh-start behaviour on their next order attempt.
    */
   async cancelOrder(userId, symbol, orderLinkId) {
     const data = {
@@ -170,12 +184,11 @@ class OrderService {
       throw new Error(`Bybit cancel error: ${response.retMsg} (retCode: ${response.retCode})`);
     }
 
-    // Roll back risk profile for this user
+    // If no trades have been executed yet (first order was placed but not filled),
+    // reset isFirstTrade so the next order placement still uses the initial risk.
     const riskProfile = await RiskProfile.findOne({ user: userId, ison: true });
-    if (riskProfile) {
-      riskProfile.currentrisk = riskProfile.previousrisk;
-      if (riskProfile.consecutiveWins > 0) riskProfile.consecutiveWins--;
-      if (riskProfile.consecutiveLosses > 0) riskProfile.consecutiveLosses--;
+    if (riskProfile && riskProfile.consecutiveWins === 0 && riskProfile.consecutiveLosses === 0) {
+      riskProfile.isFirstTrade = true;
       await riskProfile.save();
     }
 

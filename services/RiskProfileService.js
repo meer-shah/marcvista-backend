@@ -76,6 +76,7 @@ class RiskProfileService {
       payoutPercentage: sanitize(payoutPercentage, 0),
       minRiskRewardRatio: sanitize(minRiskRewardRatio, 1),
       default: sanitize(isDefault, false),
+      currentrisk: sanitize(initialRiskPerTrade, 0),
     });
 
     return { data: newRiskProfile };
@@ -165,10 +166,13 @@ class RiskProfileService {
 
       // Reset tracking fields and activate
       profile.ison = true;
-      profile.previousrisk = 0;
-      profile.currentrisk = 0;
+      profile.previousrisk = profile.currentrisk;
+      profile.currentrisk = profile.initialRiskPerTrade;
       profile.consecutiveWins = 0;
       profile.consecutiveLosses = 0;
+      profile.isFirstTrade = true;
+      profile.lastProcessedTradeId = null;
+      profile.activatedAt = new Date();
       profile.goals = [];
       await profile.save();
 
@@ -183,10 +187,13 @@ class RiskProfileService {
         const defaultProfile = await RiskProfile.findOne({ user: userId, default: true, _id: { $ne: profileId } });
         if (defaultProfile) {
           defaultProfile.ison = true;
-          defaultProfile.previousrisk = 0;
-          defaultProfile.currentrisk = 0;
+          defaultProfile.previousrisk = defaultProfile.currentrisk;
+          defaultProfile.currentrisk = defaultProfile.initialRiskPerTrade;
           defaultProfile.consecutiveWins = 0;
           defaultProfile.consecutiveLosses = 0;
+          defaultProfile.isFirstTrade = true;
+          defaultProfile.lastProcessedTradeId = null;
+          defaultProfile.activatedAt = new Date();
           defaultProfile.goals = [];
           await defaultProfile.save();
           return { message: 'Risk profile deactivated; default profile auto-activated', data: defaultProfile };
@@ -195,10 +202,13 @@ class RiskProfileService {
         const anyProfile = await RiskProfile.findOne({ user: userId, _id: { $ne: profileId } });
         if (anyProfile) {
           anyProfile.ison = true;
-          anyProfile.previousrisk = 0;
-          anyProfile.currentrisk = 0;
+          anyProfile.previousrisk = anyProfile.currentrisk;
+          anyProfile.currentrisk = anyProfile.initialRiskPerTrade;
           anyProfile.consecutiveWins = 0;
           anyProfile.consecutiveLosses = 0;
+          anyProfile.isFirstTrade = true;
+          anyProfile.lastProcessedTradeId = null;
+          anyProfile.activatedAt = new Date();
           anyProfile.goals = [];
           await anyProfile.save();
           return { message: 'Profile deactivated; another profile auto-activated', data: anyProfile };
@@ -242,6 +252,73 @@ class RiskProfileService {
     }
 
     return { message: 'Default risk profile updated successfully.', data: updatedProfile };
+  }
+  /**
+   * Process a new trade result, update streak counters, and apply reset point if needed.
+   * Returns true if the profile was updated.
+   */
+  async processNewTradeResult(userId, tradeResult, tradeId, providedProfile = null, saveProfile = true) {
+    if (!tradeResult || !tradeId) return false;
+
+    const profile = providedProfile || await RiskProfile.findOne({ user: userId, ison: true });
+    if (!profile) return false;
+
+    // Prevent double-counting
+    if (profile.lastProcessedTradeId === tradeId) {
+      return false;
+    }
+
+    const reset = Number(profile.reset) || 0;
+    let nextWins = Number(profile.consecutiveWins) || 0;
+    let nextLosses = Number(profile.consecutiveLosses) || 0;
+    let newRisk = Number(profile.currentrisk) || Number(profile.initialRiskPerTrade) || 0;
+
+    if (tradeResult === 'Win') {
+      nextWins++;
+      nextLosses = 0;
+      // Compound win
+      newRisk = newRisk * (1 + (Number(profile.increaseOnWin) || 0) / 100);
+    } else if (tradeResult === 'Loss') {
+      nextLosses++;
+      nextWins = 0;
+      // Compound loss
+      newRisk = newRisk * (1 - (Number(profile.decreaseOnLoss) || 0) / 100);
+    }
+
+    // Apply Reset Logic (Deterministic)
+    if (reset > 0 && (nextWins >= reset || nextLosses >= reset)) {
+      newRisk = Number(profile.initialRiskPerTrade);
+      nextWins = 0;
+      nextLosses = 0;
+    }
+
+    // Clamp risk
+    const minRisk = Number(profile.minRisk) || 0;
+    const maxRisk = Number(profile.maxRisk) || 100;
+    newRisk = Math.max(minRisk, Math.min(newRisk, maxRisk));
+
+    // Update profile
+    logger.info('Risk profile updating', { 
+      tradeId, 
+      result: tradeResult, 
+      oldRisk: profile.currentrisk, 
+      newRisk, 
+      oldLosses: profile.consecutiveLosses, 
+      nextLosses,
+      resetPoint: reset,
+      didReset: (reset > 0 && nextLosses === 0 && newRisk === profile.initialRiskPerTrade && tradeResult === 'Loss')
+    });
+
+    profile.previousrisk = profile.currentrisk;
+    profile.currentrisk = newRisk;
+    profile.consecutiveWins = nextWins;
+    profile.consecutiveLosses = nextLosses;
+    profile.lastProcessedTradeId = tradeId;
+
+    if (saveProfile) {
+      await profile.save();
+    }
+    return true;
   }
 }
 
