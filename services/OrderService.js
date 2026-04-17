@@ -9,6 +9,7 @@
  */
 const crypto = require('crypto');
 const RiskProfile = require('../models/riskprofilemodal');
+const Trade = require('../models/Trade');
 const { getUsdtBalance } = require('../controllers/calculations');
 const logger = require('../utils/logger');
 
@@ -36,10 +37,10 @@ class OrderService {
    */
   async simplePlaceOrder(userId, data) {
     try {
-      const orderLinkId = crypto.randomBytes(16).toString('hex');
-      
+      const orderLinkId = data.orderLinkId || crypto.randomBytes(16).toString('hex');
+
       const formatEnum = (str) => str ? str.charAt(0).toUpperCase() + str.slice(1).toLowerCase() : undefined;
-      
+
       const formattedData = {
         ...data,
         orderLinkId,
@@ -146,7 +147,8 @@ class OrderService {
 
       // 8. Prepare clean order data for Bybit
       const formatEnum = (str) => str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
-      
+
+      const orderLinkId = crypto.randomBytes(16).toString('hex');
       const bybitOrder = {
         symbol: data.symbol,
         side: data.side ? formatEnum(data.side) : undefined,
@@ -158,8 +160,46 @@ class OrderService {
         takeProfit: data.takeProfit.toString(),
         timeInForce: 'GTC',
         positionIdx: 0,
+        orderLinkId,
       };
-      return await this.simplePlaceOrder(userId, bybitOrder);
+      const result = await this.simplePlaceOrder(userId, bybitOrder);
+
+      // 9. Persist Trade record (fire-and-forget to avoid blocking order response)
+      setImmediate(async () => {
+        try {
+          const tradeNumber = await Trade.countDocuments({
+            user: userId,
+            riskProfile: riskProfile._id,
+            placedAt: { $gte: riskProfile.activatedAt || riskProfile.createdAt },
+          }) + 1;
+
+          await Trade.create({
+            user: userId,
+            riskProfile: riskProfile._id,
+            activatedAt: riskProfile.activatedAt || riskProfile.createdAt,
+            tradeNumber,
+            symbol: data.symbol,
+            side: formatEnum(data.side),
+            category: data.category || 'linear',
+            orderType: data.orderType ? formatEnum(data.orderType) : 'Limit',
+            entryPrice: orderPrice,
+            stopLoss: stopLossPrice,
+            takeProfit: parseFloat(takeProfit),
+            qty: parseFloat(newQty),
+            riskPercent: data.adjustedRisk,
+            riskAmount,
+            balanceBefore: usdtBalance,
+            orderLinkId,
+            bybitOrderId: result?.result?.orderId || null,
+            outcome: 'Pending',
+            placedAt: new Date(),
+          });
+        } catch (err) {
+          logger.error('Failed to persist Trade record', err);
+        }
+      });
+
+      return result;
 
     } catch (error) {
       logger.error('placeOrderWithRiskProfile error', error);
@@ -193,6 +233,17 @@ class OrderService {
       riskProfile.isFirstTrade = true;
       await riskProfile.save();
     }
+
+    setImmediate(async () => {
+      try {
+        await Trade.updateOne(
+          { user: userId, orderLinkId, outcome: 'Pending' },
+          { $set: { outcome: 'Cancelled', closedAt: new Date() } }
+        );
+      } catch (err) {
+        logger.error('Failed to mark Trade as Cancelled', err);
+      }
+    });
 
     return response;
   }

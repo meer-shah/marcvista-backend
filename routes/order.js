@@ -48,7 +48,10 @@ router.post('/set-leverage', orderMutationLimiter, validateBody(setLeverageSchem
 router.post('/switch-margin-mode', orderMutationLimiter, validateBody(switchMarginModeSchema), orderController.switchMarginMode); // Switch margin mode
 
 // Trade History and Risk Management Routes
-router.get('/closed-pnl', fetchinfoController.getClosedPnlf); // Get closed PnL for trade history
+router.get('/closed-pnl', fetchinfoController.getClosedPnlf); // Get closed PnL for trade history (also syncs to DB)
+router.get('/my-trades', orderController.getMyTrades); // Closed trades from our DB (canonical ledger)
+router.delete('/my-trades', orderMutationLimiter, orderController.clearTradeHistory); // Clear trade history (delete + stamp clearedAt)
+router.get('/real-performance', orderController.getRealPerformance); // Real performance metrics for active risk profile
 router.get('/showusdtbalance', fetchinfoController.showusdtbalance);
 router.get('/portfolio-summary', fetchinfoController.getPortfolioSummary);
 

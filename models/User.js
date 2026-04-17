@@ -25,6 +25,12 @@ const userSchema = new mongoose.Schema({
     type: String, // base64 data URL or URL
     default: null
   },
+  // Timestamp at which the user last cleared their trade history.
+  // Trades with closedAt <= this value are hidden from trading panel history.
+  tradeHistoryClearedAt: {
+    type: Date,
+    default: null,
+  },
   // JWT token tracking for logout
   tokens: [{
     token: String,

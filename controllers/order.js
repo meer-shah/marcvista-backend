@@ -1,7 +1,14 @@
 const RiskProfile = require('../models/riskprofilemodal');
+const Trade = require('../models/Trade');
 const OrderService = require('../services/OrderService');
+const TradeQueryService = require('../services/tradeQueryService');
+const { computePerformance } = require('../services/performanceService');
+const PortfolioService = require('../services/portfolioService');
 const { writeAuditLog } = require('../utils/audit');
 const logger = require('../utils/logger');
+
+const tradeQueryService = new TradeQueryService();
+const portfolioService = new PortfolioService();
 
 const orderService = new OrderService();
 
@@ -125,6 +132,87 @@ const getAccountBalanceFromHere = async (userId, queryParams) => {
   }
 };
 
+// ─── Real Performance (via service layer) ────────────────────────────────────
+
+const getRealPerformance = async (req, res) => {
+  try {
+    const riskProfile = await RiskProfile.findOne({ user: req.user._id, ison: true });
+    if (!riskProfile) {
+      return res.status(200).json({ summary: null, message: 'No active risk profile' });
+    }
+
+    const activatedAt = riskProfile.activatedAt || riskProfile.createdAt;
+    const trades = await tradeQueryService.getByActivationWindow(
+      req.user._id,
+      riskProfile._id,
+      activatedAt
+    );
+
+    const perf = computePerformance(trades);
+
+    return res.status(200).json({
+      summary: {
+        winRate: perf.winRate,
+        totalProfit: perf.totalProfit,
+        totalLoss: perf.totalLoss,
+        netProfit: perf.netProfit,
+        wins: perf.wins,
+        losses: perf.losses,
+        finalBalance: perf.finalBalance,
+        maxBalance: perf.maxBalance,
+        minBalance: perf.minBalance,
+        maxDrawdown: perf.maxDrawdown,
+      },
+      balanceOverTrades: perf.balanceOverTrades,
+      tradeDetails: perf.tradeDetails,
+    });
+  } catch (error) {
+    logger.error('Error in getRealPerformance', error);
+    return res.status(500).json({ error: 'Failed to fetch real performance' });
+  }
+};
+
+// ─── My Trades (Trade collection — canonical ledger) ─────────────────────────
+
+const getMyTrades = async (req, res) => {
+  try {
+    const clearedAt = req.user.tradeHistoryClearedAt || null;
+    const trades = await portfolioService.getMyTrades(req.user._id, { clearedAt });
+
+    // Normalize field names so the frontend can use the same patterns as Bybit data
+    const normalized = trades.map(t => ({
+      ...t,
+      closedPnl: t.pnl,          // portfolio page reads closedPnl
+      updatedAt: t.closedAt,      // some UI fields read updatedAt
+      size: t.qty,
+      avgEntryPrice: t.entryPrice,
+      avgExitPrice: t.exitPrice,
+    }));
+
+    res.json(normalized);
+  } catch (error) {
+    logger.error('Error in getMyTrades', error);
+    res.status(500).json({ error: 'Failed to fetch trades' });
+  }
+};
+
+// ─── Clear Trade History ─────────────────────────────────────────────────────
+
+const clearTradeHistory = async (req, res) => {
+  try {
+    const result = await portfolioService.clearTradeHistory(req.user._id);
+    writeAuditLog({ event: 'trades.cleared', userId: req.user._id, metadata: result, req });
+    res.status(200).json({
+      message: 'Trade history cleared',
+      clearedAt: result.clearedAt,
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    logger.error('Error in clearTradeHistory', error);
+    res.status(500).json({ error: 'Failed to clear trade history' });
+  }
+};
+
 module.exports = {
   placeOrder,
   cancelOrder,
@@ -133,6 +221,9 @@ module.exports = {
   switchMarginMode,
   showusdtbalance,
   getAccountBalanceFromHere,
+  getRealPerformance,
+  getMyTrades,
+  clearTradeHistory,
   // Exported for tests / external use
   placeOrderWithRiskProfile: (userId, data) => orderService.placeOrderWithRiskProfile(userId, data),
 };
