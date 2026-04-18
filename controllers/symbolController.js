@@ -2,52 +2,46 @@ const axios = require('axios');
 const { getBaseUrl } = require('../config/bybitConfig');
 const logger = require('../utils/logger');
 
+/**
+ * Return every tradable linear (USDT-perpetual) symbol for the account.
+ *
+ * Bybit's V5 API unifies crypto derivatives and TradFi-backed perpetuals
+ * (XAUUSDT, XAGUSDT, …) under `category=linear`, so this single call is
+ * enough — we just surface whatever the exchange returns for this account.
+ */
 exports.getSymbols = async (req, res) => {
   try {
-    // Fetch all linear (USDT) trading pairs from Bybit
     const baseUrl = getBaseUrl();
-    const response = await axios.get(`${baseUrl}/v5/market/instruments-info`, {
-      params: {
-        category: 'linear',  // USDT futures
-      }
+    // Use the tickers endpoint as the source of truth for tradable linear
+    // symbols: it consistently includes TradFi pairs (XAUUSDT, XAGUSDT,
+    // XAUT…) that instruments-info sometimes omits by region.
+    const response = await axios.get(`${baseUrl}/v5/market/tickers`, {
+      params: { category: 'linear' },
+      timeout: 10000,
     });
 
-    if (response.data?.retCode === 0 && response.data?.result?.list) {
-      // Extract only USDT symbols
-      const usdtSymbols = response.data.result.list
-        .filter(item => item.symbol && item.symbol.endsWith('USDT'))
-        .map(item => item.symbol)
-        .sort(); // Sort alphabetically
-
-      res.status(200).json({
-        success: true,
-        data: usdtSymbols,
-        count: usdtSymbols.length,
-        source: 'bybit_api'
-      });
-    } else {
-      throw new Error('Invalid response from Bybit API');
+    if (response.data?.retCode !== 0 || !response.data?.result?.list) {
+      throw new Error(`Invalid Bybit response: ${response.data?.retMsg || 'unknown'}`);
     }
-  } catch (error) {
-    logger.error('Error fetching symbols from Bybit', error);
-    // Fallback to static list if API fails
-    const fallbackSymbols = [
-      "BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "DOTUSDT", "XRPUSDT", "SOLUSDT",
-      "AVAXUSDT", "MATICUSDT", "LINKUSDT", "UNIUSDT", "DOGEUSDT", "SHIBUSDT",
-      "LTCUSDT", "ATOMUSDT", "ETCUSDT", "XLMUSDT", "VETUSDT", "FILUSDT", "THETAUSDT",
-      "XMRUSDT", "TRXUSDT", "XEMUSDT", "EOSUSDT", "BCHUSDT", "NEARUSDT", "APTUSDT",
-      "ARBUSDT", "OPUSDT", "SUIUSDT", "PEPEUSDT", "FLOKIUSDT", "GMXUSDT", "GALAUSDT",
-      "RUNEUSDT", "CVXUSDT", "1INCHUSDT", "BALUSDT", "ENJUSDT", "CHZUSDT", "MANAUSDT",
-      "SANDUSDT", "AXSUSDT", "HIVEUSDT", "STEPUSDT", "BNTUSDT", "CRVUSDT", "EGLDUSDT",
-      "KAVYUSDT", "KSMUSDT", "ZILUSDT", "ALGOUSDT", "ICXUSDT", "WAVESUSDT", "KNCUSDT",
-      "FETUSDT", "OCEANUSDT", "RENUSDT", "SRMUSDT", "STMXUSDT", "ANTUSDT", "GTCUSDT",
-    ];
+
+    const symbols = response.data.result.list
+      .filter(item => item.symbol && item.symbol.endsWith('USDT'))
+      .map(item => item.symbol)
+      .sort();
+
     res.status(200).json({
       success: true,
-      data: fallbackSymbols,
-      count: fallbackSymbols.length,
-      source: 'fallback',
-      warning: 'Using fallback list, Bybit API unavailable'
+      data: symbols,
+      count: symbols.length,
+      source: 'bybit_api',
+    });
+  } catch (error) {
+    logger.error('Error fetching symbols from Bybit', error);
+    res.status(502).json({
+      success: false,
+      data: [],
+      count: 0,
+      error: 'Failed to fetch symbols from Bybit',
     });
   }
 };

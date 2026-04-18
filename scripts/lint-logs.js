@@ -11,9 +11,8 @@ const ROOT = path.resolve(__dirname, '..');
 const DIRS = ['config', 'controllers', 'middleware', 'routes'].map(d => path.join(ROOT, d));
 
 // Files excluded from the check:
-// - oldorder.js, test.js: dead code, not mounted on any route
 // - encryption.js: contains "console.log" only inside an error message string literal
-const EXCLUDED = ['oldorder.js', 'test.js', 'encryption.js'];
+const EXCLUDED = ['encryption.js'];
 
 let violations = [];
 

@@ -178,7 +178,15 @@ class RiskProfileService {
 
       return { message: 'Risk profile activated successfully', data: profile };
     } else {
-      // Deactivating a profile
+      // Deactivating a profile — refuse if this is the user's only profile
+      const profileCount = await RiskProfile.countDocuments({ user: userId });
+      if (profileCount <= 1) {
+        return {
+          error: 'Cannot deactivate your only risk profile. Create another profile first.',
+          status: 400,
+        };
+      }
+
       const wasActive = profile.ison;
       profile.ison = false;
       await profile.save();

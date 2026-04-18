@@ -19,7 +19,9 @@ if (!CSRF_SECRET) {
   throw new Error('CSRF secret missing: set CSRF_SECRET or JWT_SECRET env var');
 }
 
-const CSRF_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+// 2h TTL balances risk (shorter = better) with usability (too short spams
+// /csrf-token fetches). Frontend auto-refreshes on 403 and retries once.
+const CSRF_TTL_MS = 2 * 60 * 60 * 1000;
 
 function generateToken() {
   const ts = Date.now().toString();

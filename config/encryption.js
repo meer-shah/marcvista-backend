@@ -19,20 +19,12 @@ const encrypt = (text) => {
   return `${iv.toString('hex')}:${encrypted.toString('hex')}`;
 };
 
-/**
- * Decrypt a string produced by encrypt().
- * Falls back to returning the original text if it doesn't look encrypted
- * (migration safety for any existing plaintext values in the database).
- */
 const decrypt = (text) => {
-  // Encrypted values are in format: <32-char hex iv>:<hex encrypted>
-  const parts = text.split(':');
+  const parts = typeof text === 'string' ? text.split(':') : [];
   const looksEncrypted = parts.length === 2 && /^[0-9a-f]{32}$/i.test(parts[0]);
 
   if (!looksEncrypted) {
-    // Plaintext fallback — handles records saved before encryption was added.
-    // To fully secure: delete and re-add your Bybit API connection after this update.
-    return text;
+    throw new Error('Credential is not encrypted. Please delete and re-add your Bybit API connection.');
   }
 
   try {

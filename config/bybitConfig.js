@@ -9,8 +9,19 @@ const logger = require('../utils/logger');
 // on our deploy target and every request was paying a reconnect penalty — the
 // in-memory fallback already handled missed lookups, so Redis was pure overhead.
 const CREDENTIAL_CACHE_DURATION_MS = 60 * 1000; // 60 seconds
+const CREDENTIAL_CACHE_MAX_ENTRIES = 1000;
 
+// Simple LRU: Map preserves insertion order; re-insert on hit to mark as recently used.
 const memoryCache = new Map(); // key -> { credentials, expiresAt }
+
+function cacheSet(key, value) {
+  if (memoryCache.has(key)) memoryCache.delete(key);
+  memoryCache.set(key, value);
+  if (memoryCache.size > CREDENTIAL_CACHE_MAX_ENTRIES) {
+    const oldestKey = memoryCache.keys().next().value;
+    if (oldestKey !== undefined) memoryCache.delete(oldestKey);
+  }
+}
 
 /**
  * Get Bybit API base URL from environment
@@ -34,6 +45,9 @@ async function getCredentials(userId) {
 
   const cached = memoryCache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
+    // Refresh LRU recency
+    memoryCache.delete(cacheKey);
+    memoryCache.set(cacheKey, cached);
     return cached.credentials;
   }
 
@@ -54,7 +68,7 @@ async function getCredentials(userId) {
     accountType: connection.accountType || 'demo'
   };
 
-  memoryCache.set(cacheKey, {
+  cacheSet(cacheKey, {
     credentials,
     expiresAt: now + CREDENTIAL_CACHE_DURATION_MS,
   });
@@ -114,14 +128,21 @@ async function http_request(endpoint, method, data, Info, userId = null) {
     });
     return response.data;
   } catch (error) {
-    const errorMsg = error.response?.data || error.message;
+    const rawMsg = error.response?.data || error.message;
+    const safeMessage = typeof rawMsg === 'string'
+      ? rawMsg
+      : rawMsg?.retMsg || 'Request failed';
     logger.warn('[Bybit] Request failed', {
       method,
       endpoint,
       status: error.response?.status,
-      message: typeof errorMsg === 'string' ? errorMsg : errorMsg?.retMsg || 'Request failed',
+      retCode: error.response?.data?.retCode,
+      message: safeMessage,
     });
-    throw new Error(errorMsg);
+    // Never surface raw Bybit payloads (may contain echoed headers/params).
+    const err = new Error(safeMessage);
+    err.bybitRetCode = error.response?.data?.retCode;
+    throw err;
   }
 }
 

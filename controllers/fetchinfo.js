@@ -21,7 +21,6 @@ const getOrderListf = async (req, res) => {
     );
     let orders = response?.result?.list || [];
 
-    // Transform Bybit order fields to match frontend expectations
     orders = orders.map(order => ({
       _id: order.orderId,
       symbol: order.symbol,
@@ -62,7 +61,6 @@ const getPositionInfof = async (req, res) => {
     );
     let positions = response?.result?.list || [];
 
-    // Transform positions to match frontend expectations
     positions = positions.map(pos => ({
       symbol: pos.symbol,
       size: pos.size,
@@ -83,7 +81,6 @@ const getPositionInfof = async (req, res) => {
   }
 };
 
-// Whitelist of valid Bybit account types to prevent query string injection
 const VALID_ACCOUNT_TYPES = ['UNIFIED', 'CONTRACT', 'SPOT'];
 
 const sanitizeAccountType = (raw) => {
@@ -172,7 +169,12 @@ const gettransactionlog = async (req, res) => {
 };
 
 /**
- * Get closed PnL (trade history)
+ * Get closed PnL (trade history) — also syncs trades to our DB in the background.
+ *
+ * Sync strategy (idempotent, runs after response is sent):
+ *   1. Match by orderLinkId if Bybit returns it (app trade — exact match).
+ *   2. Fall back to symbol+timing heuristic for app trades placed before this feature.
+ *   3. No match → create an 'external' Trade record (placed directly on Bybit).
  */
 const getClosedPnlf = async (req, res) => {
   try {
@@ -186,10 +188,18 @@ const getClosedPnlf = async (req, res) => {
 
     let trades = response?.result?.list || [];
 
-    // Transform trades to match frontend expectations
-    // side is reversed because Bybit returns the closing order's side;
-    // we display the original (opening) order's side instead.
-    // NOTE: side override must come AFTER ...trade so the spread doesn't overwrite it.
+    // Honour user-initiated trade history clear: hide any trade closed at/before the cutoff.
+    const clearedAtMs = req.user.tradeHistoryClearedAt
+      ? new Date(req.user.tradeHistoryClearedAt).getTime()
+      : 0;
+    if (clearedAtMs > 0) {
+      trades = trades.filter(t => {
+        const closedTs = Number(t.updatedTime || t.closedAt || 0);
+        return closedTs > clearedAtMs;
+      });
+    }
+
+    // side is reversed: Bybit returns the closing side; we display the opening side.
     trades = trades.map(trade => ({
       symbol: trade.symbol,
       size: trade.qty,
@@ -208,26 +218,15 @@ const getClosedPnlf = async (req, res) => {
     const { bestTrade, worstTrade } = findBestAndWorstTrade(trades);
     const { bestCoins, worstCoins } = analyzeCoinPerformance(trades);
 
-    // Respond immediately — don't block on risk sync
-    res.json({
-      trades,
-      metrics,
-      bestTrade,
-      worstTrade,
-      bestCoins,
-      worstCoins
-    });
+    res.json({ trades, metrics, bestTrade, worstTrade, bestCoins, worstCoins });
 
-    // Sync risk profile counters in background after response is sent.
-    // Bybit returns trades newest-first. We reverse to process oldest-first so streak
-    // counters and the reset point fire in the correct sequence.
-    // ONLY trades after the profile's activatedAt timestamp are counted.
     if (trades.length > 0) {
       setImmediate(async () => {
         try {
           const RiskProfileService = require('../services/RiskProfileService');
           const riskProfileService = new RiskProfileService();
           const RiskProfile = require('../models/riskprofilemodal');
+          const Trade = require('../models/Trade');
 
           const activeProfile = await RiskProfile.findOne({ user: req.user._id, ison: true });
           if (!activeProfile) return;
@@ -249,19 +248,164 @@ const getClosedPnlf = async (req, res) => {
 
           const unprocessedTrades = tradesAfterActivation.slice(lastProcessedIdx + 1);
 
+          // Count existing trades once for tradeNumber assignment
+          let externalTradeOffset = await Trade.countDocuments({
+            user: req.user._id,
+            riskProfile: activeProfile._id,
+            placedAt: { $gte: activeProfile.activatedAt || activeProfile.createdAt },
+          });
+
+          const tradeBulkOps = [];
+
+          // ── Batch pre-fetch to avoid N+1 queries ──
+          const candidateIds = unprocessedTrades.map(t =>
+            String(t.orderId || t.execId || `${t.symbol}-${t.updatedTime}`)
+          );
+          const candidateOrderLinkIds = unprocessedTrades
+            .map(t => t.orderLinkId)
+            .filter(Boolean);
+
+          const [existingDocs, pendingByLinkDocs, pendingBySymbolDocs] = await Promise.all([
+            Trade.find({ bybitClosedPnlId: { $in: candidateIds } })
+              .select('bybitClosedPnlId')
+              .lean(),
+            candidateOrderLinkIds.length
+              ? Trade.find({
+                  user: req.user._id,
+                  orderLinkId: { $in: candidateOrderLinkIds },
+                  outcome: 'Pending',
+                }).lean()
+              : Promise.resolve([]),
+            Trade.find({
+              user: req.user._id,
+              riskProfile: activeProfile._id,
+              outcome: 'Pending',
+            }).sort({ placedAt: 1 }).lean(),
+          ]);
+
+          const existingSet = new Set(existingDocs.map(d => d.bybitClosedPnlId));
+          const pendingByLinkMap = new Map(
+            pendingByLinkDocs.map(d => [d.orderLinkId, d])
+          );
+          // Group pending-by-symbol, preserving ascending placedAt order
+          const pendingBySymbolMap = new Map();
+          for (const d of pendingBySymbolDocs) {
+            if (!pendingBySymbolMap.has(d.symbol)) pendingBySymbolMap.set(d.symbol, []);
+            pendingBySymbolMap.get(d.symbol).push(d);
+          }
+          // Track which pending trades have been consumed by this sync pass
+          const consumedPendingIds = new Set();
+
           for (const trade of unprocessedTrades) {
+            const closedPnlId = String(trade.orderId || trade.execId || `${trade.symbol}-${trade.updatedTime}`);
+
+            // Dedup: already synced
+            if (existingSet.has(closedPnlId)) continue;
+
             const pnl = parseFloat(trade.closedPnl);
             if (isNaN(pnl)) {
-              logger.warn('Skipping trade sync: invalid PnL', { tradeId: trade.orderId || trade.execId });
+              logger.warn('Skipping trade sync: invalid PnL', { tradeId: closedPnlId });
               continue;
             }
+
+            const outcome = pnl > 0 ? 'Win' : 'Loss';
+            const exitPrice = parseFloat(trade.avgExitPrice) || null;
+            const closedTime = new Date(Number(trade.updatedTime || trade.updatedAt || trade.closedAt || Date.now()));
+
+            // ── Step 1: match by orderLinkId (present in newer Bybit responses) ──
+            let pendingTrade = null;
+            if (trade.orderLinkId) {
+              const byLink = pendingByLinkMap.get(trade.orderLinkId);
+              if (byLink && !consumedPendingIds.has(String(byLink._id))) {
+                pendingTrade = byLink;
+              }
+            }
+
+            // ── Step 2: fallback to symbol + timing heuristic ──
+            if (!pendingTrade) {
+              const symbolBucket = pendingBySymbolMap.get(trade.symbol) || [];
+              pendingTrade = symbolBucket.find(d =>
+                !consumedPendingIds.has(String(d._id)) &&
+                new Date(d.placedAt).getTime() <= closedTime.getTime()
+              ) || null;
+            }
+
+            if (pendingTrade) {
+              consumedPendingIds.add(String(pendingTrade._id));
+            }
+
+            if (pendingTrade) {
+              // App trade found — update it
+              const balanceAfter = (pendingTrade.balanceBefore || 0) + pnl;
+              const duration = pendingTrade.placedAt
+                ? closedTime.getTime() - new Date(pendingTrade.placedAt).getTime()
+                : null;
+
+              tradeBulkOps.push({
+                updateOne: {
+                  filter: { _id: pendingTrade._id },
+                  update: {
+                    $set: {
+                      outcome,
+                      pnl,
+                      exitPrice,
+                      closedAt: closedTime,
+                      balanceAfter,
+                      bybitClosedPnlId: closedPnlId,
+                      fees: parseFloat(trade.cumExecFee || 0) || null,
+                      duration,
+                    },
+                  },
+                },
+              });
+            } else {
+              // ── Step 3: no match → external trade ──
+              externalTradeOffset++;
+              const reversedSide = trade.side === 'Buy' ? 'Sell' : 'Buy';
+
+              tradeBulkOps.push({
+                insertOne: {
+                  document: {
+                    user: req.user._id,
+                    riskProfile: activeProfile._id,
+                    activatedAt: activeProfile.activatedAt || activeProfile.createdAt,
+                    tradeNumber: externalTradeOffset,
+                    symbol: trade.symbol,
+                    side: reversedSide,
+                    category: 'linear',
+                    orderType: 'Market',
+                    source: 'external',
+                    entryPrice: parseFloat(trade.avgEntryPrice) || 0,
+                    exitPrice,
+                    qty: parseFloat(trade.qty) || 0,
+                    pnl,
+                    outcome,
+                    bybitClosedPnlId: closedPnlId,
+                    bybitOrderId: trade.orderId || null,
+                    closedAt: closedTime,
+                    placedAt: closedTime, // opening time unknown for external trades
+                    fees: parseFloat(trade.cumExecFee || 0) || null,
+                  },
+                },
+              });
+            }
+          }
+
+          if (tradeBulkOps.length > 0) {
+            try {
+              await Trade.bulkWrite(tradeBulkOps, { ordered: false });
+            } catch (e) {
+              logger.error('Trade bulkWrite failed', e);
+            }
+          }
+
+          // Update risk profile streak counters for unprocessed trades
+          for (const trade of unprocessedTrades) {
+            const pnl = parseFloat(trade.closedPnl);
+            if (isNaN(pnl)) continue;
             const result = pnl > 0 ? 'Win' : 'Loss';
             const tradeId = trade.orderId || trade.execId || trade.closedAt || trade.updatedAt;
-            if (!tradeId) {
-              logger.warn('Skipping trade sync: no valid tradeId');
-              continue;
-            }
-            logger.info('Background syncing trade result', { tradeId, result });
+            if (!tradeId) continue;
             await riskProfileService.processNewTradeResult(req.user._id, result, String(tradeId));
           }
         } catch (syncError) {
@@ -273,13 +417,7 @@ const getClosedPnlf = async (req, res) => {
     logger.error('Error in getClosedPnlf', error);
     res.json({
       trades: [],
-      metrics: {
-        totalTrades: 0,
-        avgTradeOutput: 0,
-        avgWinningTrade: 0,
-        avgLosingTrade: 0,
-        winRate: 0
-      },
+      metrics: { totalTrades: 0, avgTradeOutput: 0, avgWinningTrade: 0, avgLosingTrade: 0, winRate: 0 },
       bestTrade: { closedPnl: 0 },
       worstTrade: { closedPnl: 0 },
       bestCoins: [],
@@ -289,7 +427,7 @@ const getClosedPnlf = async (req, res) => {
 };
 
 /**
- * Show USDT balance (endpoint wrapper for frontend)
+ * Show USDT balance
  */
 const showusdtbalance = async (req, res) => {
   try {
@@ -309,124 +447,56 @@ const showusdtbalance = async (req, res) => {
 };
 
 /**
- * Get portfolio summary with all metrics, volume per coin, and long/short distribution
+ * Portfolio summary — live balance + positions from Bybit; historical metrics from Trade collection.
  */
 const getPortfolioSummary = async (req, res) => {
   try {
-    // 1. Get balance
-    const balanceRes = await http_request(
-      "/v5/account/wallet-balance",
-      "GET",
-      "accountType=UNIFIED",
-      "Get Balance for Portfolio",
-      req.user._id
-    );
-    const usdtBalance = getUsdtBalance(balanceRes);
+    const PortfolioService = require('../services/portfolioService');
+    const portfolioService = new PortfolioService();
 
-    // 2. Get positions
-    const positionsRes = await http_request(
-      "/v5/position/list",
-      "GET",
-      "category=linear&settleCoin=USDT",
-      "Get Positions for Portfolio",
-      req.user._id
-    );
+    // Live data from Bybit
+    const [balanceRes, positionsRes] = await Promise.all([
+      http_request("/v5/account/wallet-balance", "GET", "accountType=UNIFIED", "Get Balance for Portfolio", req.user._id),
+      http_request("/v5/position/list", "GET", "category=linear&settleCoin=USDT", "Get Positions for Portfolio", req.user._id),
+    ]);
+
+    const usdtBalance = getUsdtBalance(balanceRes);
     const positions = positionsRes?.result?.list || [];
 
-    // 3. Get closed PnL for trade metrics
-    const pnlRes = await http_request(
-      "/v5/position/closed-pnl",
-      "GET",
-      "category=linear",
-      "Get Closed PnL for Portfolio",
-      req.user._id
+    const totalUnrealizedPnl = positions.reduce(
+      (sum, p) => sum + parseFloat(p.unrealisedPnl || p.unrealizedPnl || 0), 0
     );
-    const trades = pnlRes?.result?.list || [];
 
-    // Transform trades
-    // side is reversed because Bybit returns the closing order's side;
-    // we display the original (opening) order's side instead.
-    // NOTE: side override must come AFTER ...trade so the spread doesn't overwrite it.
-    const transformedTrades = trades.map(trade => ({
-      symbol: trade.symbol,
-      size: trade.qty,
-      quantity: trade.qty,
-      entryPrice: trade.avgEntryPrice,
-      exitPrice: trade.avgExitPrice,
-      pnl: trade.closedPnl,
-      profit: trade.closedPnl,
-      closedAt: trade.updatedTime || trade.closedAt,
-      updatedAt: trade.updatedTime,
-      ...trade,
-      side: trade.side === 'Buy' ? 'Sell' : 'Buy',
-    }));
-
-    const metrics = calculateTradeMetrics(transformedTrades);
-    const { bestTrade, worstTrade } = findBestAndWorstTrade(transformedTrades);
-
-    // Compute totalRealizedPnl from closed trades
-    const totalRealizedPnl = transformedTrades.reduce((sum, t) => sum + parseFloat(t.closedPnl || 0), 0);
-
-    // Compute totalUnrealizedPnl from open positions
-    const totalUnrealizedPnl = positions.reduce((sum, p) => sum + parseFloat(p.unrealisedPnl || p.unrealizedPnl || 0), 0);
-
-    // 4. Trading volume per coin (from closed trades)
-    const volumeMap = {};
-    transformedTrades.forEach(t => {
-      const symbol = t.symbol;
-      const vol = parseFloat(t.cumExecValue || t.size || 0);
-      volumeMap[symbol] = (volumeMap[symbol] || 0) + vol;
-    });
-    const totalVolume = Object.values(volumeMap).reduce((s, v) => s + v, 0);
-    const tradingVolumePerCoin = Object.entries(volumeMap).map(([symbol, volume]) => ({
-      symbol,
-      volume,
-      percentage: totalVolume > 0 ? (volume / totalVolume) * 100 : 0
-    })).sort((a, b) => b.volume - a.volume);
-
-    // 5. Calculate long/short distribution
+    // Long/short distribution from open positions
     const longValue = positions.filter(p => p.side === 'Buy').reduce((s, p) => s + parseFloat(p.positionValue || 0), 0);
     const shortValue = positions.filter(p => p.side === 'Sell').reduce((s, p) => s + parseFloat(p.positionValue || 0), 0);
     const totalPos = longValue + shortValue;
     const longShortData = [
       { name: 'Long', value: totalPos > 0 ? (longValue / totalPos) * 100 : 0, fill: '#22c55e' },
-      { name: 'Short', value: totalPos > 0 ? (shortValue / totalPos) * 100 : 0, fill: '#ef4444' }
+      { name: 'Short', value: totalPos > 0 ? (shortValue / totalPos) * 100 : 0, fill: '#ef4444' },
     ];
 
-    // 6. Monthly profit from closed trades
-    const monthlyMap = {};
-    transformedTrades.forEach(t => {
-      const ts = Number(t.updatedAt || t.closedAt);
-      if (!ts) return;
-      const d = new Date(ts);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-      monthlyMap[key] = (monthlyMap[key] || 0) + parseFloat(t.closedPnl || 0);
-    });
-    const monthlyProfit = Object.entries(monthlyMap)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([month, profit]) => ({ month, profit }));
-
-    // 7. Get best/worst coins
-    const { bestCoins, worstCoins } = analyzeCoinPerformance(transformedTrades);
+    // Historical metrics from Trade collection (our canonical ledger).
+    // Honour include/exclude external trades + clearedAt cutoff.
+    const includeExternal = String(req.query.includeExternal ?? 'true') !== 'false';
+    const clearedAt = req.user.tradeHistoryClearedAt || null;
+    const historicalSummary = await portfolioService.getSummary(req.user._id, { clearedAt, includeExternal });
 
     res.json({
-      // top-level fields matching frontend PortfolioSummary interface
       balance: usdtBalance,
-      totalRealizedPnl,
+      totalRealizedPnl: historicalSummary.totalRealizedPnl,
       totalUnrealizedPnl,
-      winRate: metrics.winRate,
-      totalTrades: metrics.totalTrades,
-      avgTradeProfit: metrics.avgTradeOutput,
-      bestTrade: bestTrade && bestTrade.symbol ? { symbol: bestTrade.symbol, pnl: parseFloat(bestTrade.closedPnl || 0) } : null,
-      worstTrade: worstTrade && worstTrade.symbol ? { symbol: worstTrade.symbol, pnl: parseFloat(worstTrade.closedPnl || 0) } : null,
-      bestCoins: bestCoins.map(c => ({ symbol: c.symbol, pnl: c.totalPnL })),
-      worstCoins: worstCoins.map(c => ({ symbol: c.symbol, pnl: c.totalPnL })),
-      tradingVolumePerCoin,
-      monthlyProfit,
+      winRate: historicalSummary.winRate,
+      totalTrades: historicalSummary.totalTrades,
+      avgTradeProfit: historicalSummary.avgTradeProfit,
+      bestTrade: historicalSummary.bestTrade,
+      worstTrade: historicalSummary.worstTrade,
+      bestCoins: historicalSummary.bestCoins,
+      worstCoins: historicalSummary.worstCoins,
+      tradingVolumePerCoin: historicalSummary.tradingVolumePerCoin,
+      monthlyProfit: historicalSummary.monthlyProfit,
       longShortData,
-      // also include raw data for any other consumers
       positions,
-      trades: transformedTrades,
     });
   } catch (error) {
     logger.error('Error in getPortfolioSummary', error);
@@ -434,10 +504,6 @@ const getPortfolioSummary = async (req, res) => {
   }
 };
 
-/**
- * Get account balance (used internally by order controller)
- * This is the same as getAccountBalance but without res.json wrapper
- */
 const getAccountBalanceFromHere = async (req, dataParam) => {
   try {
     const data = dataParam || "accountType=UNIFIED";
