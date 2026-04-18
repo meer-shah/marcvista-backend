@@ -187,6 +187,8 @@ const getMyTrades = async (req, res) => {
       size: t.qty,
       avgEntryPrice: t.entryPrice,
       avgExitPrice: t.exitPrice,
+      riskProfileName: t.riskProfile?.title || null,
+      riskProfile: t.riskProfile?._id || t.riskProfile,
     }));
 
     res.json(normalized);

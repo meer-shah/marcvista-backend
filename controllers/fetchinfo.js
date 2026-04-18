@@ -257,12 +257,50 @@ const getClosedPnlf = async (req, res) => {
 
           const tradeBulkOps = [];
 
+          // ── Batch pre-fetch to avoid N+1 queries ──
+          const candidateIds = unprocessedTrades.map(t =>
+            String(t.orderId || t.execId || `${t.symbol}-${t.updatedTime}`)
+          );
+          const candidateOrderLinkIds = unprocessedTrades
+            .map(t => t.orderLinkId)
+            .filter(Boolean);
+
+          const [existingDocs, pendingByLinkDocs, pendingBySymbolDocs] = await Promise.all([
+            Trade.find({ bybitClosedPnlId: { $in: candidateIds } })
+              .select('bybitClosedPnlId')
+              .lean(),
+            candidateOrderLinkIds.length
+              ? Trade.find({
+                  user: req.user._id,
+                  orderLinkId: { $in: candidateOrderLinkIds },
+                  outcome: 'Pending',
+                }).lean()
+              : Promise.resolve([]),
+            Trade.find({
+              user: req.user._id,
+              riskProfile: activeProfile._id,
+              outcome: 'Pending',
+            }).sort({ placedAt: 1 }).lean(),
+          ]);
+
+          const existingSet = new Set(existingDocs.map(d => d.bybitClosedPnlId));
+          const pendingByLinkMap = new Map(
+            pendingByLinkDocs.map(d => [d.orderLinkId, d])
+          );
+          // Group pending-by-symbol, preserving ascending placedAt order
+          const pendingBySymbolMap = new Map();
+          for (const d of pendingBySymbolDocs) {
+            if (!pendingBySymbolMap.has(d.symbol)) pendingBySymbolMap.set(d.symbol, []);
+            pendingBySymbolMap.get(d.symbol).push(d);
+          }
+          // Track which pending trades have been consumed by this sync pass
+          const consumedPendingIds = new Set();
+
           for (const trade of unprocessedTrades) {
             const closedPnlId = String(trade.orderId || trade.execId || `${trade.symbol}-${trade.updatedTime}`);
 
             // Dedup: already synced
-            const exists = await Trade.findOne({ bybitClosedPnlId: closedPnlId }).lean();
-            if (exists) continue;
+            if (existingSet.has(closedPnlId)) continue;
 
             const pnl = parseFloat(trade.closedPnl);
             if (isNaN(pnl)) {
@@ -277,22 +315,23 @@ const getClosedPnlf = async (req, res) => {
             // ── Step 1: match by orderLinkId (present in newer Bybit responses) ──
             let pendingTrade = null;
             if (trade.orderLinkId) {
-              pendingTrade = await Trade.findOne({
-                user: req.user._id,
-                orderLinkId: trade.orderLinkId,
-                outcome: 'Pending',
-              }).lean();
+              const byLink = pendingByLinkMap.get(trade.orderLinkId);
+              if (byLink && !consumedPendingIds.has(String(byLink._id))) {
+                pendingTrade = byLink;
+              }
             }
 
             // ── Step 2: fallback to symbol + timing heuristic ──
             if (!pendingTrade) {
-              pendingTrade = await Trade.findOne({
-                user: req.user._id,
-                riskProfile: activeProfile._id,
-                symbol: trade.symbol,
-                outcome: 'Pending',
-                placedAt: { $lte: closedTime },
-              }).sort({ placedAt: 1 }).lean();
+              const symbolBucket = pendingBySymbolMap.get(trade.symbol) || [];
+              pendingTrade = symbolBucket.find(d =>
+                !consumedPendingIds.has(String(d._id)) &&
+                new Date(d.placedAt).getTime() <= closedTime.getTime()
+              ) || null;
+            }
+
+            if (pendingTrade) {
+              consumedPendingIds.add(String(pendingTrade._id));
             }
 
             if (pendingTrade) {

@@ -6,6 +6,28 @@
  */
 const Trade = require('../models/Trade');
 
+// Short-lived in-memory cache for portfolio summaries. TTL is intentionally
+// small — trade history changes on every new close, and the cache exists only
+// to collapse duplicate requests within the same polling tick.
+const SUMMARY_CACHE_TTL_MS = 15 * 1000;
+const SUMMARY_CACHE_MAX_ENTRIES = 500;
+const summaryCache = new Map(); // key -> { value, expiresAt }
+
+function summaryCacheSet(key, value) {
+  if (summaryCache.has(key)) summaryCache.delete(key);
+  summaryCache.set(key, value);
+  if (summaryCache.size > SUMMARY_CACHE_MAX_ENTRIES) {
+    const oldest = summaryCache.keys().next().value;
+    if (oldest !== undefined) summaryCache.delete(oldest);
+  }
+}
+
+function invalidateSummaryCache(userId) {
+  for (const key of summaryCache.keys()) {
+    if (key.startsWith(`${userId}:`)) summaryCache.delete(key);
+  }
+}
+
 class PortfolioService {
   /**
    * Return historical portfolio metrics for a user.
@@ -15,6 +37,13 @@ class PortfolioService {
    */
   async getSummary(userId, options = {}) {
     const { clearedAt = null, includeExternal = true } = options;
+
+    const cacheKey = `${userId}:${clearedAt ? new Date(clearedAt).getTime() : 0}:${includeExternal ? 1 : 0}`;
+    const now = Date.now();
+    const cached = summaryCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.value;
+    }
 
     const query = {
       user: userId,
@@ -30,7 +59,7 @@ class PortfolioService {
     const trades = await Trade.find(query).sort({ closedAt: 1, placedAt: 1 }).lean();
 
     if (!trades.length) {
-      return {
+      const empty = {
         totalRealizedPnl: 0,
         winRate: 0,
         totalTrades: 0,
@@ -42,6 +71,8 @@ class PortfolioService {
         tradingVolumePerCoin: [],
         monthlyProfit: [],
       };
+      summaryCacheSet(cacheKey, { value: empty, expiresAt: now + SUMMARY_CACHE_TTL_MS });
+      return empty;
     }
 
     let wins = 0;
@@ -88,7 +119,7 @@ class PortfolioService {
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([month, profit]) => ({ month, profit }));
 
-    return {
+    const result = {
       totalRealizedPnl: totalPnl,
       winRate: (wins / trades.length) * 100,
       totalTrades: trades.length,
@@ -100,6 +131,8 @@ class PortfolioService {
       tradingVolumePerCoin,
       monthlyProfit,
     };
+    summaryCacheSet(cacheKey, { value: result, expiresAt: now + SUMMARY_CACHE_TTL_MS });
+    return result;
   }
 
   /**
@@ -115,7 +148,10 @@ class PortfolioService {
     if (clearedAt) {
       query.closedAt = { $gt: new Date(clearedAt) };
     }
-    return Trade.find(query).sort({ closedAt: -1, placedAt: -1 }).lean();
+    return Trade.find(query)
+      .sort({ closedAt: -1, placedAt: -1 })
+      .populate('riskProfile', 'title')
+      .lean();
   }
 
   /**
@@ -127,6 +163,7 @@ class PortfolioService {
     const now = new Date();
     const deleted = await Trade.deleteMany({ user: userId });
     await User.updateOne({ _id: userId }, { $set: { tradeHistoryClearedAt: now } });
+    invalidateSummaryCache(String(userId));
     return { clearedAt: now, deletedCount: deleted.deletedCount || 0 };
   }
 }

@@ -46,7 +46,6 @@ async function verifyBybitCredentials(apiKey, secretKey, accountType = 'demo') {
       status: error.response?.status,
       message: errorMsg,
       retCode: error.response?.data?.retCode,
-      responseData: error.response?.data
     });
     return {
       valid: false,
