@@ -8,6 +8,40 @@ const {
 } = require('./calculations');
 
 /**
+ * Infer the OPENING side of a closed-PnL trade from its P&L sign and prices.
+ *
+ * Bybit's `/v5/position/closed-pnl` `side` field reports the side of the
+ * *closing* order for TP/SL/auto-close, but when a user manually closes a
+ * position on Bybit's UI the `side` reported there can be the *opening*
+ * side instead — leading the old naive `flip(trade.side)` logic to display
+ * the wrong direction for manually-closed trades.
+ *
+ * P&L arithmetic is direction-independent and reliable across every close
+ * path (TP, SL, manual, liquidation):
+ *   Long  profit ⇔ exit > entry   |   Long  loss  ⇔ exit < entry
+ *   Short profit ⇔ exit < entry   |   Short loss  ⇔ exit > entry
+ *
+ * Fallback: if prices or PnL are missing/equal (shouldn't happen in
+ * practice), we fall back to the old flip-the-reported-side behaviour so
+ * the regression surface stays small.
+ */
+function inferOpeningSide(trade) {
+  const entry = parseFloat(trade.avgEntryPrice);
+  const exit = parseFloat(trade.avgExitPrice);
+  const pnl = parseFloat(trade.closedPnl);
+
+  if (Number.isFinite(entry) && Number.isFinite(exit) && Number.isFinite(pnl) && entry !== exit && pnl !== 0) {
+    const priceWentUp = exit > entry;
+    const profitable = pnl > 0;
+    // Long iff (price up ∧ profit) OR (price down ∧ loss)
+    return priceWentUp === profitable ? 'Buy' : 'Sell';
+  }
+
+  // Fallback: flip whatever Bybit reported (original behaviour)
+  return trade.side === 'Buy' ? 'Sell' : 'Buy';
+}
+
+/**
  * Collapse Bybit closed-PnL rows that belong to the same logical order.
  *
  * Bybit returns one row per partial fill. All partials from the same order
@@ -278,7 +312,11 @@ const getClosedPnlf = async (req, res) => {
       });
     }
 
-    // side is reversed: Bybit returns the closing side; we display the opening side.
+    // Display the OPENING side: inferred from PnL + price direction, which
+    // is correct regardless of whether the trade closed via TP/SL, auto-close,
+    // or manual-close on the Bybit UI (manual close sometimes reports the
+    // opening side as `trade.side` rather than the closing side, so a naive
+    // flip would invert direction only for manually-closed trades).
     trades = trades.map(trade => ({
       symbol: trade.symbol,
       size: trade.qty,
@@ -290,7 +328,7 @@ const getClosedPnlf = async (req, res) => {
       closedAt: trade.updatedTime || trade.closedAt,
       updatedAt: trade.updatedTime,
       ...trade,
-      side: trade.side === 'Buy' ? 'Sell' : 'Buy',
+      side: inferOpeningSide(trade),
     }));
 
     const metrics = calculateTradeMetrics(trades);
@@ -440,7 +478,7 @@ const getClosedPnlf = async (req, res) => {
             } else {
               // ── Step 3: no match → external trade ──
               externalTradeOffset++;
-              const reversedSide = trade.side === 'Buy' ? 'Sell' : 'Buy';
+              const openingSide = inferOpeningSide(trade);
 
               tradeBulkOps.push({
                 insertOne: {
@@ -450,7 +488,7 @@ const getClosedPnlf = async (req, res) => {
                     activatedAt: activeProfile.activatedAt || activeProfile.createdAt,
                     tradeNumber: externalTradeOffset,
                     symbol: trade.symbol,
-                    side: reversedSide,
+                    side: openingSide,
                     category: 'linear',
                     orderType: 'Market',
                     source: 'external',
