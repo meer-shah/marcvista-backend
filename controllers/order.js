@@ -44,8 +44,20 @@ const placeOrder = async (req, res) => {
             return res.status(200).json({ message: "Order placed with risk profile" });
         }
     } catch (error) {
-        logger.error('Error in placeOrder', error);
-        return res.status(500).json({ error: 'Failed to place order' });
+        logger.error('Error in placeOrder', {
+            userId: req.user?._id,
+            symbol: req.body?.symbol,
+            side: req.body?.side,
+            message: error?.message,
+            bybitRetCode: error?.bybitRetCode,
+            bybitRetMsg: error?.bybitRetMsg,
+            stack: error?.stack,
+        });
+        return res.status(500).json({
+            error: 'Failed to place order',
+            detail: error?.bybitRetMsg || error?.message || 'Unknown error',
+            bybitRetCode: error?.bybitRetCode,
+        });
     }
 };
 
@@ -102,8 +114,20 @@ const setLeverage = async (req, res) => {
         const response = await orderService.setLeverage(req.user._id, symbol, buyLeverage, sellLeverage);
         res.status(200).json(response);
     } catch (error) {
-        logger.error('Error in setLeverage', error);
-        res.status(500).json({ error: "Failed to set leverage" });
+        logger.error('Error in setLeverage', {
+            userId: req.user?._id,
+            symbol: req.body?.symbol,
+            message: error?.message,
+            bybitRetCode: error?.bybitRetCode,
+            bybitRetMsg: error?.bybitRetMsg,
+        });
+        // Bybit rejection (e.g. leverage out of range, wrong margin mode) → 400 with detail
+        const status = error?.bybitRetCode ? 400 : 500;
+        res.status(status).json({
+            error: 'Failed to set leverage',
+            detail: error?.bybitRetMsg || error?.message || 'Unknown error',
+            bybitRetCode: error?.bybitRetCode,
+        });
     }
 };
 

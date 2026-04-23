@@ -8,6 +8,80 @@ const {
 } = require('./calculations');
 
 /**
+ * Collapse Bybit closed-PnL rows that belong to the same logical order.
+ *
+ * Bybit returns one row per partial fill. All partials from the same order
+ * share the same `orderLinkId` (for app-placed orders) or the same `orderId`
+ * (fallback for external orders). Treating each fill as a separate trade
+ * inflates trade count and distorts win-rate / best-worst / streak logic.
+ *
+ * Rows without `orderLinkId` AND without `orderId` are left untouched.
+ */
+function aggregatePartialFills(rawTrades) {
+  const groups = new Map();
+  const singletons = [];
+
+  for (const t of rawTrades) {
+    const key = t.orderLinkId || t.orderId;
+    if (!key) {
+      singletons.push(t);
+      continue;
+    }
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(t);
+  }
+
+  const aggregated = [];
+  for (const [, fills] of groups) {
+    if (fills.length === 1) {
+      aggregated.push(fills[0]);
+      continue;
+    }
+
+    let totalQty = 0;
+    let totalPnl = 0;
+    let totalFees = 0;
+    let entryNotional = 0;
+    let exitNotional = 0;
+    let latestTime = 0;
+    let earliestCreated = Infinity;
+
+    for (const f of fills) {
+      const qty = parseFloat(f.qty) || 0;
+      const entry = parseFloat(f.avgEntryPrice) || 0;
+      const exit = parseFloat(f.avgExitPrice) || 0;
+      totalQty += qty;
+      totalPnl += parseFloat(f.closedPnl) || 0;
+      totalFees += parseFloat(f.cumExecFee) || 0;
+      entryNotional += qty * entry;
+      exitNotional += qty * exit;
+      const upd = Number(f.updatedTime || f.closedAt || 0);
+      if (upd > latestTime) latestTime = upd;
+      const created = Number(f.createdTime || 0);
+      if (created && created < earliestCreated) earliestCreated = created;
+    }
+
+    const latest = fills.reduce((a, b) =>
+      Number(a.updatedTime || 0) >= Number(b.updatedTime || 0) ? a : b
+    );
+
+    aggregated.push({
+      ...latest,
+      qty: totalQty.toString(),
+      closedPnl: totalPnl.toString(),
+      cumExecFee: totalFees.toString(),
+      avgEntryPrice: totalQty > 0 ? (entryNotional / totalQty).toString() : latest.avgEntryPrice,
+      avgExitPrice: totalQty > 0 ? (exitNotional / totalQty).toString() : latest.avgExitPrice,
+      updatedTime: latestTime ? latestTime.toString() : latest.updatedTime,
+      createdTime: Number.isFinite(earliestCreated) ? earliestCreated.toString() : latest.createdTime,
+      _aggregatedFills: fills.length,
+    });
+  }
+
+  return [...aggregated, ...singletons];
+}
+
+/**
  * Get pending orders (excluding conditional orders)
  */
 const getOrderListf = async (req, res) => {
@@ -187,6 +261,11 @@ const getClosedPnlf = async (req, res) => {
     );
 
     let trades = response?.result?.list || [];
+
+    // Collapse partial fills of the same order into one logical trade.
+    // Bybit returns one row per fill; without this, a single order that fills
+    // in 4 chunks would count as 4 wins/losses and distort metrics.
+    trades = aggregatePartialFills(trades);
 
     // Honour user-initiated trade history clear: hide any trade closed at/before the cutoff.
     const clearedAtMs = req.user.tradeHistoryClearedAt

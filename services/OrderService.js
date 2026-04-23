@@ -266,9 +266,18 @@ class OrderService {
       sellLeverage: sellLeverage.toString(),
     });
 
+    // 110043 = "leverage not modified" — requested leverage already in effect.
+    // Treat as success so the UI doesn't surface a misleading error.
+    if (response.retCode === 110043) {
+      return { ...response, retCode: 0, retMsg: 'Leverage already set' };
+    }
+
     if (response.retCode !== 0) {
       logger.error('Bybit setLeverage error', { symbol, buyLeverage, sellLeverage, response });
-      throw new Error(`Bybit API error: ${response.retMsg} (retCode: ${response.retCode})`);
+      const err = new Error(`Bybit API error: ${response.retMsg} (retCode: ${response.retCode})`);
+      err.bybitRetCode = response.retCode;
+      err.bybitRetMsg = response.retMsg;
+      throw err;
     }
 
     return response;
