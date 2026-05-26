@@ -31,6 +31,15 @@ const userSchema = new mongoose.Schema({
     type: Date,
     default: null,
   },
+  // The exchange currently selected for trading. Risk-profile state, position
+  // gating, balance and ticker all scope to this exchange. User may have
+  // credentials stored for multiple exchanges but only one is "active" at a time.
+  activeExchange: {
+    type: String,
+    enum: ['bybit', 'binance', 'okx', 'bitget', 'mexc'],
+    default: 'bybit',
+    index: true,
+  },
   // JWT token tracking for logout
   tokens: [{
     token: String,

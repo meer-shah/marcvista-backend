@@ -7,6 +7,14 @@ const tradeSchema = new Schema({
   activatedAt: { type: Date, required: true },
   tradeNumber: { type: Number, required: true },
 
+  // Which exchange this trade was placed on. Existing rows backfill to
+  // 'bybit' so historical metrics remain attributable.
+  exchange: {
+    type: String,
+    enum: ['bybit', 'binance', 'okx', 'bitget', 'mexc'],
+    default: 'bybit',
+    index: true,
+  },
   symbol: { type: String, required: true },
   side: { type: String, enum: ['Buy', 'Sell'], required: true },
   category: { type: String, default: 'linear' },
@@ -53,6 +61,8 @@ const tradeSchema = new Schema({
 tradeSchema.index({ user: 1, riskProfile: 1, placedAt: -1 });
 tradeSchema.index({ user: 1, symbol: 1, outcome: 1 });
 tradeSchema.index({ user: 1, source: 1, placedAt: -1 });
+tradeSchema.index({ user: 1, exchange: 1, placedAt: -1 });
+tradeSchema.index({ user: 1, exchange: 1, outcome: 1 });
 tradeSchema.index({ user: 1, tags: 1 });
 tradeSchema.index({ bybitClosedPnlId: 1 }, { unique: true, sparse: true });
 

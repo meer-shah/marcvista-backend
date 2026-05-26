@@ -164,7 +164,15 @@ mongoose.connect(process.env.MONGO_URI, {
   serverSelectionTimeoutMS: 5000,  // fail fast if MongoDB is unreachable
   socketTimeoutMS: 45000,          // drop idle sockets after 45 s
 })
-  .then(() => {
+  .then(async () => {
+    // Run idempotent migrations BEFORE accepting traffic. Migrations are
+    // safe to re-run on every boot — they no-op after the first apply.
+    try {
+      const { migrate } = require('./scripts/migrate-multi-exchange');
+      await migrate();
+    } catch (err) {
+      logger.error('Migration failed (continuing boot)', { message: err?.message });
+    }
     app.listen(process.env.PORT, () => {
       logger.info('server started', { port: process.env.PORT });
     });
