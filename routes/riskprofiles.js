@@ -7,7 +7,8 @@ const {
   updateRiskProfile,
   activateprofile,
   getActiveRiskProfile,
-  resetdeault
+  resetdeault,
+  resetRiskState,
 } = require('../controllers/riskprofilecontroller');
 const { authMiddleware } = require('../middleware/auth');
 const { validateBody, validateParams } = require('../middleware/validate');
@@ -34,6 +35,8 @@ router.get('/:id', validateParams(riskProfileIdParamSchema), getSingleRiskProfil
 // Create a new risk profile
 router.post('/', validateBody(riskProfileCreateSchema), createRiskProfile);
 router.post('/reset-default', validateBody(riskProfileResetDefaultSchema), resetdeault);
+// Reset per-exchange runtime state (currentrisk + streak) for the active profile.
+router.post('/reset-state', resetRiskState);
 
 // Delete a risk profile
 router.delete('/:id', validateParams(riskProfileIdParamSchema), deleteRiskProfile);

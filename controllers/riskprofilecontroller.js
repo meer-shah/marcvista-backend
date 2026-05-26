@@ -105,6 +105,41 @@ const resetdeault = async (req, res) => {
   }
 };
 
+/**
+ * Reset the runtime state for the user's active risk profile on a specific
+ * exchange. Wipes currentrisk back to initialRiskPerTrade, zeroes the streak
+ * counters, and sets isFirstTrade=true. Does NOT touch other exchanges'
+ * state for the same profile — they remain frozen at their current values.
+ *
+ * Body: { exchange?: string }   // defaults to user.activeExchange
+ */
+const resetRiskState = async (req, res) => {
+  try {
+    const User = require('../models/User');
+    const user = await User.findById(req.user._id).select('activeExchange').lean();
+    const exchange = String(req.body?.exchange || user?.activeExchange || 'bybit').toLowerCase();
+    const allowed = ['bybit', 'binance', 'okx', 'bitget', 'mexc'];
+    if (!allowed.includes(exchange)) {
+      return res.status(400).json({ error: `Unsupported exchange: ${exchange}` });
+    }
+    const state = await service.resetState(req.user._id, exchange);
+    if (!state) return res.status(404).json({ error: 'No active risk profile found' });
+    res.json({
+      message: `Risk profile streak reset on ${exchange}`,
+      exchange,
+      state: {
+        currentrisk: state.currentrisk,
+        consecutiveWins: state.consecutiveWins,
+        consecutiveLosses: state.consecutiveLosses,
+        isFirstTrade: state.isFirstTrade,
+      },
+    });
+  } catch (error) {
+    logger.error('Error in resetRiskState', { message: error?.message });
+    res.status(500).json({ error: 'Failed to reset risk state' });
+  }
+};
+
 module.exports = {
   getAllRiskProfiles,
   getSingleRiskProfile,
@@ -113,5 +148,6 @@ module.exports = {
   updateRiskProfile,
   activateprofile,
   getActiveRiskProfile,
-  resetdeault
+  resetdeault,
+  resetRiskState,
 };
