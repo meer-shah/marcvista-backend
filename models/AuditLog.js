@@ -18,6 +18,7 @@ const auditLogSchema = new mongoose.Schema(
         'order.placed',
         'order.cancelled',
         'order.amended',
+        'trades.cleared',
       ],
       index: true,
     },

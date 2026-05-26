@@ -28,6 +28,8 @@ const tradeSchema = new Schema({
   pnl: { type: Number, default: 0 },
   payout: { type: Number, default: 0 },
   fees: { type: Number, default: null },
+  feeMode: { type: String, enum: ['maker', 'taker'], default: null }, // predicted at order time
+  feeReserveUsd: { type: Number, default: null }, // fee budget reserved at order time
   duration: { type: Number, default: null }, // milliseconds between place and close
   outcome: {
     type: String,

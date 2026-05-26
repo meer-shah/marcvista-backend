@@ -42,6 +42,46 @@ function inferOpeningSide(trade) {
 }
 
 /**
+ * Pure helper — accumulate a late partial-fill into an existing closed trade.
+ * Returns the new accumulator state. Exported for unit testing.
+ *
+ * @param {object} prev - existing accumulator OR the original Trade doc on first merge
+ * @param {object} fill - { pnl, qty, fees, exitPrice, closedAtMs, closedPnlId }
+ * @param {object} [opts] - { isFirstMerge: boolean } — true when prev is the raw Trade doc
+ */
+function mergeFillIntoAccum(prev, fill, opts = {}) {
+  const { isFirstMerge = false } = opts;
+  const base = isFirstMerge
+    ? {
+        pnl: Number(prev.pnl) || 0,
+        qty: Number(prev.qty) || 0,
+        fees: Number(prev.fees) || 0,
+        closedAt: prev.closedAt ? new Date(prev.closedAt).getTime() : 0,
+        exitPrice: Number(prev.exitPrice) || 0,
+        exitNotional: (Number(prev.exitPrice) || 0) * (Number(prev.qty) || 0),
+        balanceBefore: Number(prev.balanceBefore) || 0,
+        newClosedPnlIds: [],
+      }
+    : prev;
+
+  const next = {
+    ...base,
+    pnl: base.pnl + (Number(fill.pnl) || 0),
+    qty: base.qty + (Number(fill.qty) || 0),
+    fees: base.fees + (Number(fill.fees) || 0),
+    closedAt: Math.max(base.closedAt || 0, Number(fill.closedAtMs) || 0),
+    newClosedPnlIds: [...base.newClosedPnlIds, fill.closedPnlId],
+  };
+  const fillQty = Number(fill.qty) || 0;
+  const fillExit = Number(fill.exitPrice) || 0;
+  if (fillExit && fillQty) {
+    next.exitNotional = base.exitNotional + fillExit * fillQty;
+    next.exitPrice = next.qty > 0 ? next.exitNotional / next.qty : fillExit;
+  }
+  return next;
+}
+
+/**
  * Collapse Bybit closed-PnL rows that belong to the same logical order.
  *
  * Bybit returns one row per partial fill. All partials from the same order
@@ -112,7 +152,47 @@ function aggregatePartialFills(rawTrades) {
     });
   }
 
-  return [...aggregated, ...singletons];
+  // Second pass — collapse fills of the same symbol + side that closed within
+  // PROXIMITY_MS of each other. Bybit sometimes splits a single TP/SL close
+  // into multiple rows with *different* orderIds and no shared orderLinkId
+  // (e.g. partial liquidations, multiple-tranche TP), which the primary
+  // grouping above would treat as separate trades.
+  const PROXIMITY_MS = 5000;
+  const all = [...aggregated, ...singletons]
+    .sort((a, b) => Number(a.updatedTime || 0) - Number(b.updatedTime || 0));
+  const collapsed = [];
+  for (const t of all) {
+    const last = collapsed[collapsed.length - 1];
+    if (
+      last &&
+      last.symbol === t.symbol &&
+      last.side && t.side && last.side === t.side &&
+      Math.abs(Number(t.updatedTime || 0) - Number(last.updatedTime || 0)) <= PROXIMITY_MS
+    ) {
+      const lastQty = parseFloat(last.qty) || 0;
+      const tQty = parseFloat(t.qty) || 0;
+      const totalQty = lastQty + tQty;
+      const lastEntry = parseFloat(last.avgEntryPrice) || 0;
+      const tEntry = parseFloat(t.avgEntryPrice) || 0;
+      const lastExit = parseFloat(last.avgExitPrice) || 0;
+      const tExit = parseFloat(t.avgExitPrice) || 0;
+      const merged = {
+        ...last,
+        qty: totalQty.toString(),
+        closedPnl: ((parseFloat(last.closedPnl) || 0) + (parseFloat(t.closedPnl) || 0)).toString(),
+        cumExecFee: ((parseFloat(last.cumExecFee) || 0) + (parseFloat(t.cumExecFee) || 0)).toString(),
+        avgEntryPrice: totalQty > 0 ? ((lastQty * lastEntry + tQty * tEntry) / totalQty).toString() : last.avgEntryPrice,
+        avgExitPrice: totalQty > 0 ? ((lastQty * lastExit + tQty * tExit) / totalQty).toString() : last.avgExitPrice,
+        updatedTime: Math.max(Number(last.updatedTime || 0), Number(t.updatedTime || 0)).toString(),
+        _aggregatedFills: (last._aggregatedFills || 1) + (t._aggregatedFills || 1),
+        _timeProximityMerged: true,
+      };
+      collapsed[collapsed.length - 1] = merged;
+    } else {
+      collapsed.push(t);
+    }
+  }
+  return collapsed;
 }
 
 /**
@@ -349,7 +429,14 @@ const getClosedPnlf = async (req, res) => {
           if (!activeProfile) return;
 
           const activatedAt = (activeProfile.activatedAt ? new Date(activeProfile.activatedAt).getTime() : 0) - 5000;
-          const tradesChronological = [...trades].reverse();
+          // Sort EXPLICITLY by updatedTime ascending (oldest → newest). Do NOT
+          // rely on Bybit's response order — aggregatePartialFills can reorder
+          // rows during the proximity merge, and a naive .reverse() would flip
+          // the wrong way and cause newer trades to be skipped by the
+          // lastProcessedTradeId slice below.
+          const tradesChronological = [...trades].sort((a, b) =>
+            Number(a.updatedTime || a.closedAt || 0) - Number(b.updatedTime || b.closedAt || 0)
+          );
 
           const tradesAfterActivation = tradesChronological.filter(t => {
             const closedTime = Number(t.updatedTime || t.updatedAt || t.closedAt || 0);
@@ -382,10 +469,20 @@ const getClosedPnlf = async (req, res) => {
             .map(t => t.orderLinkId)
             .filter(Boolean);
 
-          const [existingDocs, pendingByLinkDocs, pendingBySymbolDocs] = await Promise.all([
+          // Also look up already-CLOSED app trades by orderLinkId so a late-arriving
+          // partial fill (e.g. TP closes a position in two chunks with the same
+          // orderLinkId) is merged into the existing trade rather than written
+          // as a duplicate "external" row.
+          const recentWindowMs = 5 * 60 * 1000;
+          const recentSinceDate = new Date(Date.now() - 24 * 60 * 60 * 1000);
+          const [existingDocs, mergedHistoryDocs, pendingByLinkDocs, pendingBySymbolDocs, closedByLinkDocs, recentClosedAppDocs] = await Promise.all([
             Trade.find({ bybitClosedPnlId: { $in: candidateIds } })
               .select('bybitClosedPnlId')
               .lean(),
+            Trade.find({
+              user: req.user._id,
+              'metadata.mergedClosedPnlIds': { $in: candidateIds },
+            }).select('metadata.mergedClosedPnlIds').lean(),
             candidateOrderLinkIds.length
               ? Trade.find({
                   user: req.user._id,
@@ -398,12 +495,58 @@ const getClosedPnlf = async (req, res) => {
               riskProfile: activeProfile._id,
               outcome: 'Pending',
             }).sort({ placedAt: 1 }).lean(),
+            candidateOrderLinkIds.length
+              ? Trade.find({
+                  user: req.user._id,
+                  orderLinkId: { $in: candidateOrderLinkIds },
+                  outcome: { $in: ['Win', 'Loss'] },
+                  source: 'app',
+                }).lean()
+              : Promise.resolve([]),
+            Trade.find({
+              user: req.user._id,
+              source: 'app',
+              outcome: { $in: ['Win', 'Loss'] },
+              closedAt: { $gte: recentSinceDate },
+            }).sort({ closedAt: -1 }).lean(),
           ]);
 
+          const closedByLinkMap = new Map(
+            closedByLinkDocs.map(d => [d.orderLinkId, d])
+          );
+          // Group recently-closed app trades by symbol for time-proximity merge fallback
+          const recentClosedBySymbol = new Map();
+          for (const d of recentClosedAppDocs) {
+            if (!recentClosedBySymbol.has(d.symbol)) recentClosedBySymbol.set(d.symbol, []);
+            recentClosedBySymbol.get(d.symbol).push(d);
+          }
+          // Track in-memory merges so multiple fills in the same sync pass aggregate correctly
+          const mergedAccum = new Map(); // _id -> { pnl, qty, fees, closedAt, exitPrice, balanceAfter }
+          // Fills that were merged into an existing closed trade — they should NOT
+          // tick the risk-profile streak again (the original close already did).
+          const mergedOnlyFillIds = new Set();
+          // Fills that became EXTERNAL trades (placed directly on Bybit, not via
+          // the app). These must NOT adjust the risk-profile streak — risk math
+          // is the single-source-of-truth from app trades only.
+          const externalFillIds = new Set();
+
           const existingSet = new Set(existingDocs.map(d => d.bybitClosedPnlId));
+          for (const d of mergedHistoryDocs) {
+            const ids = (d.metadata && d.metadata.mergedClosedPnlIds) || [];
+            for (const id of ids) existingSet.add(id);
+          }
           const pendingByLinkMap = new Map(
             pendingByLinkDocs.map(d => [d.orderLinkId, d])
           );
+          // Also index Pending trades by bybitOrderId — Bybit auto-generates a
+          // *different* orderLinkId for the SL/TP-triggered closing order, so
+          // the closed-pnl row often won't match the entry's orderLinkId.
+          // The Bybit orderId of the entry, stored on the Pending row, is the
+          // reliable link for app trades.
+          const pendingByBybitOrderIdMap = new Map();
+          for (const d of pendingBySymbolDocs) {
+            if (d.bybitOrderId) pendingByBybitOrderIdMap.set(String(d.bybitOrderId), d);
+          }
           // Group pending-by-symbol, preserving ascending placedAt order
           const pendingBySymbolMap = new Map();
           for (const d of pendingBySymbolDocs) {
@@ -438,6 +581,16 @@ const getClosedPnlf = async (req, res) => {
               }
             }
 
+            // ── Step 1b: match by entry's Bybit orderId. SL/TP-triggered closes
+            // have a different orderLinkId than the entry, but the closed-pnl
+            // row still references the original entry orderId in many cases.
+            if (!pendingTrade && trade.orderId) {
+              const byBybitId = pendingByBybitOrderIdMap.get(String(trade.orderId));
+              if (byBybitId && !consumedPendingIds.has(String(byBybitId._id))) {
+                pendingTrade = byBybitId;
+              }
+            }
+
             // ── Step 2: fallback to symbol + timing heuristic ──
             if (!pendingTrade) {
               const symbolBucket = pendingBySymbolMap.get(trade.symbol) || [];
@@ -449,6 +602,22 @@ const getClosedPnlf = async (req, res) => {
 
             if (pendingTrade) {
               consumedPendingIds.add(String(pendingTrade._id));
+            }
+
+            // ── Step 2b: if no Pending match, look for an existing CLOSED app trade
+            // to merge this late partial fill into (same orderLinkId, or same
+            // symbol within 5 min of a prior close).
+            let mergeTarget = null;
+            if (!pendingTrade) {
+              if (trade.orderLinkId && closedByLinkMap.has(trade.orderLinkId)) {
+                mergeTarget = closedByLinkMap.get(trade.orderLinkId);
+              } else {
+                const bucket = recentClosedBySymbol.get(trade.symbol) || [];
+                mergeTarget = bucket.find(d => {
+                  const dt = new Date(d.closedAt).getTime();
+                  return Math.abs(dt - closedTime.getTime()) <= recentWindowMs;
+                }) || null;
+              }
             }
 
             if (pendingTrade) {
@@ -475,8 +644,52 @@ const getClosedPnlf = async (req, res) => {
                   },
                 },
               });
+            } else if (mergeTarget) {
+              // Merge this late fill into the existing closed app trade so the
+              // user sees one logical trade (not an "Exchange" duplicate).
+              // Defer the DB write until after the loop so multiple fills
+              // against the same target produce a single, final update.
+              const targetId = String(mergeTarget._id);
+              const fillQty = parseFloat(trade.qty) || 0;
+              const fillFee = parseFloat(trade.cumExecFee || 0) || 0;
+              const accum = mergedAccum.get(targetId) || {
+                _doc: mergeTarget,
+                pnl: mergeTarget.pnl || 0,
+                qty: mergeTarget.qty || 0,
+                fees: mergeTarget.fees || 0,
+                closedAt: new Date(mergeTarget.closedAt).getTime(),
+                exitPrice: mergeTarget.exitPrice || 0,
+                exitNotional: (mergeTarget.exitPrice || 0) * (mergeTarget.qty || 0),
+                balanceBefore: mergeTarget.balanceBefore || 0,
+                newClosedPnlIds: [],
+              };
+              accum.pnl += pnl;
+              accum.qty += fillQty;
+              accum.fees += fillFee;
+              if (exitPrice && fillQty) {
+                accum.exitNotional += exitPrice * fillQty;
+                accum.exitPrice = accum.qty > 0 ? accum.exitNotional / accum.qty : exitPrice;
+              }
+              if (closedTime.getTime() > accum.closedAt) accum.closedAt = closedTime.getTime();
+              accum.newClosedPnlIds.push(closedPnlId);
+              mergedAccum.set(targetId, accum);
+              existingSet.add(closedPnlId);
+              mergedOnlyFillIds.add(closedPnlId);
             } else {
               // ── Step 3: no match → external trade ──
+              // Diagnostic — if you see this for an order placed via the app,
+              // the Pending Trade row was likely never persisted (Trade.create
+              // failed during placement). Check the OrderService error logs.
+              externalFillIds.add(closedPnlId);
+              logger.warn('Closed-pnl row had no matching Pending app trade — labeling as external', {
+                userId: String(req.user._id),
+                symbol: trade.symbol,
+                bybitOrderId: trade.orderId,
+                bybitOrderLinkId: trade.orderLinkId,
+                closedTime: closedTime.toISOString(),
+                pendingCountForSymbol: (pendingBySymbolMap.get(trade.symbol) || []).length,
+                pendingTotal: pendingBySymbolDocs.length,
+              });
               externalTradeOffset++;
               const openingSide = inferOpeningSide(trade);
 
@@ -501,11 +714,39 @@ const getClosedPnlf = async (req, res) => {
                     bybitOrderId: trade.orderId || null,
                     closedAt: closedTime,
                     placedAt: closedTime, // opening time unknown for external trades
-                    fees: parseFloat(trade.cumExecFee || 0) || null,
+                    fees: (() => {
+                      const f = parseFloat(trade.cumExecFee);
+                      return Number.isFinite(f) ? f : null;
+                    })(),
                   },
                 },
               });
             }
+          }
+
+          // Flush merged-accum into a single update per target
+          for (const [targetId, accum] of mergedAccum) {
+            const newOutcome = accum.pnl > 0 ? 'Win' : 'Loss';
+            tradeBulkOps.push({
+              updateOne: {
+                filter: { _id: targetId },
+                update: {
+                  $set: {
+                    pnl: accum.pnl,
+                    qty: accum.qty,
+                    fees: accum.fees,
+                    exitPrice: accum.exitPrice || accum._doc.exitPrice,
+                    closedAt: new Date(accum.closedAt),
+                    outcome: newOutcome,
+                    balanceAfter: accum.balanceBefore + accum.pnl,
+                  },
+                  $addToSet: {
+                    tags: 'merged-partial',
+                    'metadata.mergedClosedPnlIds': { $each: accum.newClosedPnlIds },
+                  },
+                },
+              },
+            });
           }
 
           if (tradeBulkOps.length > 0) {
@@ -516,10 +757,17 @@ const getClosedPnlf = async (req, res) => {
             }
           }
 
-          // Update risk profile streak counters for unprocessed trades
+          // Update risk profile streak counters for unprocessed trades.
+          // Skip:
+          //   - merged-only fills (the original close already ticked the streak)
+          //   - external fills (trades placed directly on Bybit, not via the app)
+          // Risk math = single source of truth from APP trades only.
           for (const trade of unprocessedTrades) {
             const pnl = parseFloat(trade.closedPnl);
             if (isNaN(pnl)) continue;
+            const closedPnlId = String(trade.orderId || trade.execId || `${trade.symbol}-${trade.updatedTime}`);
+            if (mergedOnlyFillIds.has(closedPnlId)) continue;
+            if (externalFillIds.has(closedPnlId)) continue;
             const result = pnl > 0 ? 'Win' : 'Loss';
             const tradeId = trade.orderId || trade.execId || trade.closedAt || trade.updatedAt;
             if (!tradeId) continue;
@@ -648,5 +896,9 @@ module.exports = {
   getClosedPnlf,
   showusdtbalance,
   getPortfolioSummary,
-  getAccountBalanceFromHere
+  getAccountBalanceFromHere,
+  // Exported for unit testing
+  mergeFillIntoAccum,
+  aggregatePartialFills,
+  inferOpeningSide,
 };

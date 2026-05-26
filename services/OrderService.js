@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const RiskProfile = require('../models/riskprofilemodal');
 const Trade = require('../models/Trade');
 const { getUsdtBalance } = require('../controllers/calculations');
+const { classifyFillType, computeFeeAwareQty, effectiveRR, MAKER_FEE, TAKER_FEE } = require('../utils/feeMath');
 const logger = require('../utils/logger');
 
 // Default broker — BybitBroker singleton used by the controller.
@@ -135,15 +136,55 @@ class OrderService {
         data.adjustedRisk = riskProfile.currentrisk;
       }
 
-      // 7. Calculate position size using final adjustedRisk
+      // 7. Calculate FEE-INCLUSIVE position size.
+      // Total loss at SL (price-move loss + entry fee + SL exit fee) will equal
+      // the stated risk amount exactly. Fee mode is predicted from side+entry+live:
+      // a Limit that crosses the spread fills Taker, one priced passively fills Maker.
       const orderPrice = parseFloat(price);
       const stopLossPrice = parseFloat(stopLoss);
+      const takeProfitPrice = parseFloat(takeProfit);
       const riskPerUnit = Math.abs(orderPrice - stopLossPrice);
       if (riskPerUnit <= 0) this._throwError('Stop loss must differ from entry price');
-      
+
       const riskAmount = (data.adjustedRisk / 100) * usdtBalance;
-      const newQty = (riskAmount / riskPerUnit).toFixed(precision);
+
+      const livePrice = parseFloat(tickerInfo.lastPrice);
+      const normalizedSide = data.side
+        ? data.side.charAt(0).toUpperCase() + data.side.slice(1).toLowerCase()
+        : 'Buy';
+      const feeMode = classifyFillType(normalizedSide, orderPrice, livePrice);
+      const feeEntry = feeMode === 'maker' ? MAKER_FEE : TAKER_FEE;
+      const feeExit = TAKER_FEE; // TP/SL exits trigger as market
+
+      const qtyRaw = computeFeeAwareQty({
+        riskUsd: riskAmount,
+        entry: orderPrice,
+        stopLoss: stopLossPrice,
+        feeEntry,
+        feeExit,
+      });
+      const newQty = qtyRaw.toFixed(precision);
       if (parseFloat(newQty) <= 0) this._throwError('Calculated order quantity is zero or negative');
+
+      // 7b. Enforce minimum R:R *after fees*. Since total_loss == riskAmount
+      // by construction, the effective R:R is netGain / riskAmount.
+      const effRR = effectiveRR({
+        riskUsd: riskAmount,
+        qty: parseFloat(newQty),
+        entry: orderPrice,
+        takeProfit: takeProfitPrice,
+        feeEntry,
+        feeExit,
+      });
+      if (effRR < minRiskRewardRatio) {
+        this._throwError(
+          `Effective R:R after fees ${effRR.toFixed(2)} is below the profile minimum ${minRiskRewardRatio}. Widen TP or tighten SL.`
+        );
+      }
+
+      // Reserved fee budget — useful for the Trade record and debugging.
+      const qtyNum = parseFloat(newQty);
+      const feeReserveUsd = qtyNum * orderPrice * feeEntry + qtyNum * stopLossPrice * feeExit;
 
       // 8. Prepare clean order data for Bybit
       const formatEnum = (str) => str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
@@ -164,40 +205,53 @@ class OrderService {
       };
       const result = await this.simplePlaceOrder(userId, bybitOrder);
 
-      // 9. Persist Trade record (fire-and-forget to avoid blocking order response)
-      setImmediate(async () => {
-        try {
-          const tradeNumber = await Trade.countDocuments({
-            user: userId,
-            riskProfile: riskProfile._id,
-            placedAt: { $gte: riskProfile.activatedAt || riskProfile.createdAt },
-          }) + 1;
+      // 9. Persist Trade record SYNCHRONOUSLY — must complete before we return,
+      // otherwise a race or silent error leaves no Pending row in our DB and
+      // the closed-pnl sync labels the eventual SL/TP fill as "external".
+      try {
+        const tradeNumber = await Trade.countDocuments({
+          user: userId,
+          riskProfile: riskProfile._id,
+          placedAt: { $gte: riskProfile.activatedAt || riskProfile.createdAt },
+        }) + 1;
 
-          await Trade.create({
-            user: userId,
-            riskProfile: riskProfile._id,
-            activatedAt: riskProfile.activatedAt || riskProfile.createdAt,
-            tradeNumber,
-            symbol: data.symbol,
-            side: formatEnum(data.side),
-            category: data.category || 'linear',
-            orderType: data.orderType ? formatEnum(data.orderType) : 'Limit',
-            entryPrice: orderPrice,
-            stopLoss: stopLossPrice,
-            takeProfit: parseFloat(takeProfit),
-            qty: parseFloat(newQty),
-            riskPercent: data.adjustedRisk,
-            riskAmount,
-            balanceBefore: usdtBalance,
-            orderLinkId,
-            bybitOrderId: result?.result?.orderId || null,
-            outcome: 'Pending',
-            placedAt: new Date(),
-          });
-        } catch (err) {
-          logger.error('Failed to persist Trade record', err);
-        }
-      });
+        await Trade.create({
+          user: userId,
+          riskProfile: riskProfile._id,
+          activatedAt: riskProfile.activatedAt || riskProfile.createdAt,
+          tradeNumber,
+          symbol: data.symbol,
+          side: formatEnum(data.side),
+          category: data.category || 'linear',
+          orderType: data.orderType ? formatEnum(data.orderType) : 'Limit',
+          entryPrice: orderPrice,
+          stopLoss: stopLossPrice,
+          takeProfit: parseFloat(takeProfit),
+          qty: parseFloat(newQty),
+          riskPercent: data.adjustedRisk,
+          riskAmount,
+          balanceBefore: usdtBalance,
+          feeMode,
+          feeReserveUsd,
+          orderLinkId,
+          bybitOrderId: result?.result?.orderId || null,
+          outcome: 'Pending',
+          placedAt: new Date(),
+        });
+      } catch (err) {
+        // The order is already live on Bybit. Log loudly so we can investigate;
+        // do NOT throw — we don't want the user to see a failure for an order
+        // that actually went through. But this means the sync may label it
+        // external if the SL/TP closes it.
+        logger.error('Failed to persist Trade record (order is LIVE on Bybit but no Pending row in our DB)', {
+          userId,
+          symbol: data.symbol,
+          orderLinkId,
+          bybitOrderId: result?.result?.orderId,
+          message: err?.message,
+          stack: err?.stack,
+        });
+      }
 
       return result;
 

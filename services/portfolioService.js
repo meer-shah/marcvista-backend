@@ -155,13 +155,18 @@ class PortfolioService {
   }
 
   /**
-   * Delete all trades for a user and stamp the clear timestamp on the User doc.
-   * Any Bybit-synced trades that close before this timestamp will be filtered out going forward.
+   * Delete CLOSED trades for a user and stamp the clear timestamp on the User doc.
+   * Pending (in-flight) trades are preserved — deleting them would orphan the
+   * eventual Bybit closed-pnl row, which the sync would then mis-label as
+   * an "external" trade.
    */
   async clearTradeHistory(userId) {
     const User = require('../models/User');
     const now = new Date();
-    const deleted = await Trade.deleteMany({ user: userId });
+    const deleted = await Trade.deleteMany({
+      user: userId,
+      outcome: { $in: ['Win', 'Loss', 'Cancelled'] }, // explicitly excludes 'Pending'
+    });
     await User.updateOne({ _id: userId }, { $set: { tradeHistoryClearedAt: now } });
     invalidateSummaryCache(String(userId));
     return { clearedAt: now, deletedCount: deleted.deletedCount || 0 };
