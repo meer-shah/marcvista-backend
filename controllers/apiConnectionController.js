@@ -318,8 +318,49 @@ exports.setActiveExchange = async (req, res) => {
     if (!connection) {
       return res.status(400).json({ message: `${exchange} not connected — add credentials first.` });
     }
-    await User.updateOne({ _id: req.user._id }, { $set: { activeExchange: exchange } });
-    res.json({ activeExchange: exchange });
+
+    // Switch the user's active exchange + restore that exchange's previously-
+    // chosen risk profile. Each exchange remembers its own active profile in
+    // user.activeRiskProfileByExchange — switching back must surface the
+    // profile that was active there, NOT whatever was active on the prior
+    // exchange. RiskProfile.ison is rewritten so legacy reads still work.
+    const user = await User.findById(req.user._id).select('activeRiskProfileByExchange activeExchange');
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+
+    user.activeExchange = exchange;
+
+    // Look up which profile should be active on the new exchange. Two cases:
+    //  (a) Map has an entry → flip ison to that profile.
+    //  (b) No entry yet (first switch to this exchange) → leave the current
+    //      globally-active profile as-is and seed the map with it.
+    const RiskProfile = require('../models/riskprofilemodal');
+    let targetProfileId = user.activeRiskProfileByExchange
+      ? user.activeRiskProfileByExchange.get(exchange)
+      : null;
+
+    if (!targetProfileId) {
+      const currentlyOn = await RiskProfile.findOne({ user: req.user._id, ison: true }).select('_id').lean();
+      if (currentlyOn) {
+        targetProfileId = currentlyOn._id;
+        if (!user.activeRiskProfileByExchange) user.activeRiskProfileByExchange = new Map();
+        user.activeRiskProfileByExchange.set(exchange, currentlyOn._id);
+      }
+    }
+
+    if (targetProfileId) {
+      // Flip ison flags atomically — exactly one ison:true per user at any moment.
+      await RiskProfile.updateMany(
+        { user: req.user._id, ison: true, _id: { $ne: targetProfileId } },
+        { $set: { ison: false } }
+      );
+      await RiskProfile.updateOne(
+        { _id: targetProfileId, user: req.user._id },
+        { $set: { ison: true } }
+      );
+    }
+
+    await user.save();
+    res.json({ activeExchange: exchange, activeRiskProfile: targetProfileId || null });
   } catch (err) {
     logger.error('Error in setActiveExchange', err);
     res.status(500).json({ message: 'Error setting active exchange.' });

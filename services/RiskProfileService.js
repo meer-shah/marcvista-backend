@@ -176,6 +176,24 @@ class RiskProfileService {
       profile.goals = [];
       await profile.save();
 
+      // PER-EXCHANGE active-profile pointer. Record that THIS profile is now
+      // the active one on the user's CURRENT exchange. Other exchanges keep
+      // their previously-chosen profile in the map and will restore it when
+      // the user switches back. RiskProfile.ison stays in sync with whatever
+      // is active on the user's current exchange.
+      try {
+        const User = require('../models/User');
+        const user = await User.findById(userId).select('activeExchange activeRiskProfileByExchange');
+        if (user) {
+          const ex = user.activeExchange || 'bybit';
+          if (!user.activeRiskProfileByExchange) user.activeRiskProfileByExchange = new Map();
+          user.activeRiskProfileByExchange.set(ex, profile._id);
+          await user.save();
+        }
+      } catch (err) {
+        logger.warn('Failed to record per-exchange active profile', { message: err?.message });
+      }
+
       // NOTE: we deliberately do NOT wipe RiskProfileState rows here. Per
       // the multi-exchange design, each (profile, exchange) state is
       // preserved independently — toggling a profile on/off must not lose

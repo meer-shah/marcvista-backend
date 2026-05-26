@@ -40,6 +40,15 @@ const userSchema = new mongoose.Schema({
     default: 'bybit',
     index: true,
   },
+  // Per-exchange active risk-profile pointer — keyed by exchange id, value =
+  // the profile ObjectId active on that exchange. Lets each exchange remember
+  // its own profile selection. RiskProfile.ison is kept in sync with this map
+  // for the user's currently-active exchange so legacy code paths still work.
+  activeRiskProfileByExchange: {
+    type: Map,
+    of: { type: mongoose.Schema.Types.ObjectId, ref: 'RiskProfile' },
+    default: () => new Map(),
+  },
   // JWT token tracking for logout
   tokens: [{
     token: String,

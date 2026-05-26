@@ -20,7 +20,7 @@
 const mongoose = require('mongoose');
 const logger = require('../utils/logger');
 
-const MIGRATION_ID = '2026-05-26-multi-exchange-foundations-v2';
+const MIGRATION_ID = '2026-05-26-multi-exchange-foundations-v3';
 
 async function alreadyApplied(db) {
   const doc = await db.collection('migrations').findOne({ _id: MIGRATION_ID });
@@ -121,6 +121,26 @@ async function migrate() {
   } catch (err) {
     logger.warn('Could not drop legacy apiconnections unique index', { message: err?.message });
   }
+
+  // 6) Seed User.activeRiskProfileByExchange for the user's current active
+  // exchange with whichever profile is currently ison=true. Without this,
+  // the very first exchange switch on an existing account would have an
+  // empty map and lose the user's selection.
+  const users = await db.collection('users').find({}).toArray();
+  let seeded = 0;
+  for (const u of users) {
+    const ex = u.activeExchange || 'bybit';
+    const map = u.activeRiskProfileByExchange || {};
+    if (map[ex]) continue; // already seeded
+    const active = await db.collection('riskprofiles').findOne({ user: u._id, ison: true });
+    if (!active) continue;
+    await db.collection('users').updateOne(
+      { _id: u._id },
+      { $set: { [`activeRiskProfileByExchange.${ex}`]: active._id } }
+    );
+    seeded++;
+  }
+  touched.activeRiskProfileSeeded = seeded;
 
   await markApplied(db);
   logger.info('Multi-exchange migration applied', { id: MIGRATION_ID, ...touched });
