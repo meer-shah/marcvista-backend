@@ -1,9 +1,15 @@
 const ApiConnection = require('../models/ApiConnection');
+const User = require('../models/User');
 const { clearCredentialCache, getBaseUrl } = require('../config/bybitConfig');
+const { clearCache: clearMultiExchangeCache, listConnectedExchanges } = require('../config/credentials');
+const { getBroker, listExchanges } = require('../services/brokers');
 const crypto = require('crypto');
 const axios = require('axios');
 const logger = require('../utils/logger');
 const { writeAuditLog } = require('../utils/audit');
+
+const SUPPORTED_EXCHANGES = ['bybit', 'binance', 'okx', 'bitget', 'mexc'];
+const EXCHANGES_REQUIRING_PASSPHRASE = new Set(['okx', 'bitget']);
 
 // Helper to verify Bybit credentials by making a test API call
 async function verifyBybitCredentials(apiKey, secretKey, accountType = 'demo') {
@@ -149,6 +155,191 @@ exports.getApiConnection = async (req, res) => {
     });
   }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-exchange endpoints — Phase 3
+//
+// Existing addApiConnection / getApiConnection / deleteApiConnection above
+// remain for backwards compat (they implicitly target 'bybit'). The new
+// endpoints below are exchange-aware and should be preferred by the UI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Static metadata for the Connection UI to render its exchange list. */
+exports.listSupportedExchanges = async (req, res) => {
+  res.json({ exchanges: listExchanges() });
+};
+
+/** What exchanges this user has credentials for, and the user's active one. */
+exports.getConnectionStatus = async (req, res) => {
+  try {
+    const connections = await listConnectedExchanges(req.user._id);
+    const user = await User.findById(req.user._id).select('activeExchange').lean();
+    res.json({
+      activeExchange: user?.activeExchange || 'bybit',
+      connections, // [{exchange, mode, updatedAt}]
+    });
+  } catch (err) {
+    logger.error('Error in getConnectionStatus', err);
+    res.status(500).json({ message: 'Error fetching connection status.' });
+  }
+};
+
+/**
+ * Verify credentials by asking the broker for the USDT balance.
+ * If it returns without throwing, creds are valid.
+ */
+async function verifyExchangeCredentials(broker, ctx) {
+  try {
+    const balance = await broker.getUsdtBalance(ctx);
+    return { valid: true, balance };
+  } catch (err) {
+    return { valid: false, error: err?.message || 'Verification failed' };
+  }
+}
+
+/**
+ * POST /api/connection/:exchange — add or replace credentials for one exchange.
+ * Body: { apiKey, secretKey, passphrase?, mode: 'demo'|'real' }
+ * The broker is called immediately with the new creds to verify them before
+ * persisting; failure returns 400 with the exchange's error message.
+ */
+exports.connectExchange = async (req, res) => {
+  const exchange = String(req.params.exchange || '').toLowerCase();
+  if (!SUPPORTED_EXCHANGES.includes(exchange)) {
+    return res.status(400).json({ message: `Unsupported exchange: ${exchange}` });
+  }
+  let { apiKey, secretKey, passphrase = null, mode = 'demo' } = req.body || {};
+  apiKey = (apiKey || '').trim();
+  secretKey = (secretKey || '').trim();
+  passphrase = passphrase ? String(passphrase).trim() : null;
+  if (!apiKey || !secretKey) {
+    return res.status(400).json({ message: 'apiKey and secretKey are required.' });
+  }
+  if (EXCHANGES_REQUIRING_PASSPHRASE.has(exchange) && !passphrase) {
+    return res.status(400).json({ message: `${exchange} requires a passphrase.` });
+  }
+  if (!['demo', 'real'].includes(mode)) mode = 'demo';
+
+  try {
+    // Persist temporarily so the broker can read via getExchangeCredentials.
+    // Use a transactional dance: upsert, verify, rollback on failure.
+    const existing = await ApiConnection.findOne({ user: req.user._id, exchange });
+    const previousState = existing ? existing.toObject() : null;
+
+    if (existing) {
+      existing.apiKey = apiKey;
+      existing.secretKey = secretKey;
+      existing.passphrase = passphrase || null;
+      existing.mode = mode;
+      existing.accountType = mode === 'real' ? 'live' : 'demo';
+      await existing.save();
+    } else {
+      await ApiConnection.create({
+        user: req.user._id,
+        exchange,
+        apiKey,
+        secretKey,
+        passphrase: passphrase || null,
+        mode,
+        accountType: mode === 'real' ? 'live' : 'demo',
+      });
+    }
+    clearMultiExchangeCache(req.user._id, exchange);
+
+    const broker = getBroker(exchange);
+    const verification = await verifyExchangeCredentials(broker, { userId: String(req.user._id), mode });
+
+    if (!verification.valid) {
+      // Roll back: restore previous state or delete the new row.
+      if (previousState) {
+        await ApiConnection.updateOne(
+          { user: req.user._id, exchange },
+          {
+            $set: {
+              apiKey: previousState.apiKey,
+              secretKey: previousState.secretKey,
+              passphrase: previousState.passphrase,
+              mode: previousState.mode,
+              accountType: previousState.accountType,
+            },
+          }
+        );
+      } else {
+        await ApiConnection.deleteOne({ user: req.user._id, exchange });
+      }
+      clearMultiExchangeCache(req.user._id, exchange);
+      return res.status(400).json({
+        message: `Invalid ${exchange} credentials.`,
+        error: verification.error,
+      });
+    }
+
+    writeAuditLog({ event: 'credential.added', userId: req.user._id, metadata: { exchange, mode }, req });
+    res.status(201).json({
+      message: `${exchange} credentials saved and verified.`,
+      exchange,
+      mode,
+      balance: verification.balance,
+    });
+  } catch (err) {
+    logger.error('Error in connectExchange', { exchange, message: err?.message });
+    res.status(500).json({ message: `Error saving ${exchange} credentials.` });
+  }
+};
+
+/** DELETE /api/connection/:exchange — disconnect a specific exchange. */
+exports.disconnectExchange = async (req, res) => {
+  const exchange = String(req.params.exchange || '').toLowerCase();
+  if (!SUPPORTED_EXCHANGES.includes(exchange)) {
+    return res.status(400).json({ message: `Unsupported exchange: ${exchange}` });
+  }
+  try {
+    const result = await ApiConnection.deleteOne({ user: req.user._id, exchange });
+    clearMultiExchangeCache(req.user._id, exchange);
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: `No ${exchange} credentials to delete.` });
+    }
+    writeAuditLog({ event: 'credential.deleted', userId: req.user._id, metadata: { exchange }, req });
+    res.json({ message: `${exchange} disconnected.` });
+  } catch (err) {
+    logger.error('Error in disconnectExchange', err);
+    res.status(500).json({ message: `Error disconnecting ${exchange}.` });
+  }
+};
+
+/** POST /api/connection/active-exchange  body: { exchange } */
+exports.setActiveExchange = async (req, res) => {
+  const exchange = String(req.body?.exchange || '').toLowerCase();
+  if (!SUPPORTED_EXCHANGES.includes(exchange)) {
+    return res.status(400).json({ message: `Unsupported exchange: ${exchange}` });
+  }
+  try {
+    const connection = await ApiConnection.findOne({ user: req.user._id, exchange });
+    if (!connection) {
+      return res.status(400).json({ message: `${exchange} not connected — add credentials first.` });
+    }
+    await User.updateOne({ _id: req.user._id }, { $set: { activeExchange: exchange } });
+    res.json({ activeExchange: exchange });
+  } catch (err) {
+    logger.error('Error in setActiveExchange', err);
+    res.status(500).json({ message: 'Error setting active exchange.' });
+  }
+};
+
+/** GET /api/connection/active-exchange — quick fetch for header / chart prefix. */
+exports.getActiveExchange = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id).select('activeExchange').lean();
+    res.json({ activeExchange: user?.activeExchange || 'bybit' });
+  } catch (err) {
+    logger.error('Error in getActiveExchange', err);
+    res.status(500).json({ message: 'Error fetching active exchange.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Legacy single-exchange endpoint kept for back-compat
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Controller to delete API Key and Secret Key for current user
 exports.deleteApiConnection = async (req, res) => {

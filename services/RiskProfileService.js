@@ -328,6 +328,116 @@ class RiskProfileService {
     }
     return true;
   }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Per-exchange runtime state — Phase 3 of multi-exchange.
+  // The methods below operate on the RiskProfileState collection so each
+  // exchange evolves independently from the same RiskProfile config.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Fetch (or lazily create) the RiskProfileState for (user, active profile, exchange).
+   * Returns null if the user has no active risk profile.
+   */
+  async getOrCreateState(userId, exchange) {
+    const RiskProfileState = require('../models/RiskProfileState');
+    const profile = await RiskProfile.findOne({ user: userId, ison: true });
+    if (!profile) return { profile: null, state: null };
+
+    let state = await RiskProfileState.findOne({
+      user: userId,
+      riskProfile: profile._id,
+      exchange,
+    });
+
+    if (!state) {
+      state = await RiskProfileState.create({
+        user: userId,
+        riskProfile: profile._id,
+        exchange,
+        currentrisk: profile.initialRiskPerTrade || 0,
+        previousrisk: 0,
+        consecutiveWins: 0,
+        consecutiveLosses: 0,
+        isFirstTrade: true,
+        lastProcessedTradeId: null,
+        activatedAt: new Date(),
+      });
+    }
+    return { profile, state };
+  }
+
+  /**
+   * Reset the per-exchange runtime state for a user — wipes streak counters
+   * back to initial. Useful when historical drift from mis-classified trades
+   * has corrupted the streak.
+   */
+  async resetState(userId, exchange) {
+    const RiskProfileState = require('../models/RiskProfileState');
+    const { state, profile } = await this.getOrCreateState(userId, exchange);
+    if (!state || !profile) return null;
+    state.currentrisk = profile.initialRiskPerTrade || 0;
+    state.previousrisk = 0;
+    state.consecutiveWins = 0;
+    state.consecutiveLosses = 0;
+    state.isFirstTrade = true;
+    state.lastProcessedTradeId = null;
+    state.activatedAt = new Date();
+    await state.save();
+    return state;
+  }
+
+  /**
+   * Per-exchange variant of processNewTradeResult. Same business rules as the
+   * legacy method, but mutates RiskProfileState (per-exchange) instead of
+   * RiskProfile (global).
+   */
+  async processNewTradeResultForExchange(userId, exchange, tradeResult, tradeId) {
+    if (!tradeResult || !tradeId) return false;
+    const { profile, state } = await this.getOrCreateState(userId, exchange);
+    if (!profile || !state) return false;
+    if (state.lastProcessedTradeId === tradeId) return false;
+
+    const reset = Number(profile.reset) || 0;
+    let nextWins = Number(state.consecutiveWins) || 0;
+    let nextLosses = Number(state.consecutiveLosses) || 0;
+    let newRisk = Number(state.currentrisk) || Number(profile.initialRiskPerTrade) || 0;
+
+    if (tradeResult === 'Win') {
+      nextWins++;
+      nextLosses = 0;
+      newRisk = newRisk * (1 + (Number(profile.increaseOnWin) || 0) / 100);
+    } else if (tradeResult === 'Loss') {
+      nextLosses++;
+      nextWins = 0;
+      newRisk = newRisk * (1 - (Number(profile.decreaseOnLoss) || 0) / 100);
+    }
+
+    if (reset > 0 && (nextWins >= reset || nextLosses >= reset)) {
+      newRisk = Number(profile.initialRiskPerTrade);
+      nextWins = 0;
+      nextLosses = 0;
+    }
+
+    const minRisk = Number(profile.minRisk) || 0;
+    const maxRisk = Number(profile.maxRisk) || 100;
+    newRisk = Math.max(minRisk, Math.min(newRisk, maxRisk));
+
+    logger.info('RiskProfileState updating', {
+      exchange, tradeId, result: tradeResult,
+      oldRisk: state.currentrisk, newRisk,
+      oldLosses: state.consecutiveLosses, nextLosses,
+    });
+
+    state.previousrisk = state.currentrisk;
+    state.currentrisk = newRisk;
+    state.consecutiveWins = nextWins;
+    state.consecutiveLosses = nextLosses;
+    state.lastProcessedTradeId = tradeId;
+    state.isFirstTrade = false;
+    await state.save();
+    return true;
+  }
 }
 
 module.exports = RiskProfileService;
