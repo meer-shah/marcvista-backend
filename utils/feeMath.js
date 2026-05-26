@@ -18,6 +18,32 @@ const TAKER_FEE = 0.00055;
 const FILL_TYPE_TOLERANCE_PCT = 0.0002; // 0.02% — treat entry within this of live as Taker
 
 /**
+ * Per-exchange Maker/Taker rates at VIP-0 for USDT linear perpetuals.
+ * Source of truth: the broker class's static `feeRates()`. This table is a
+ * fallback when the broker can't be loaded (e.g. in pure unit tests).
+ */
+const EXCHANGE_FEES = {
+  bybit:   { maker: 0.0002, taker: 0.00055 },
+  binance: { maker: 0.0002, taker: 0.0005 },
+  okx:     { maker: 0.0002, taker: 0.0005 },
+  bitget:  { maker: 0.0002, taker: 0.0006 },
+  mexc:    { maker: 0.0,    taker: 0.0001 },
+};
+
+/**
+ * Resolve fee rates for an exchange. Prefers the broker class (single source
+ * of truth); falls back to the table above if the broker can't be required
+ * (mostly for tests).
+ */
+function feeRatesFor(exchange) {
+  try {
+    const { CLASSES } = require('../services/brokers');
+    if (CLASSES && CLASSES[exchange]) return CLASSES[exchange].feeRates();
+  } catch { /* swallow */ }
+  return EXCHANGE_FEES[exchange] || EXCHANGE_FEES.bybit;
+}
+
+/**
  * Predict whether a Limit order will fill as Maker or Taker.
  * A Limit that crosses the live spread fills Taker; one that rests passively fills Maker.
  * Defaults to Taker when livePrice is unavailable or input is invalid (safer for sizing).
@@ -81,6 +107,8 @@ module.exports = {
   MAKER_FEE,
   TAKER_FEE,
   FILL_TYPE_TOLERANCE_PCT,
+  EXCHANGE_FEES,
+  feeRatesFor,
   classifyFillType,
   computeFeeAwareQty,
   effectiveRR,
