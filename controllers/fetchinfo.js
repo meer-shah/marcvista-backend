@@ -771,6 +771,19 @@ const getClosedPnlf = async (req, res) => {
             const result = pnl > 0 ? 'Win' : 'Loss';
             const tradeId = trade.orderId || trade.execId || trade.closedAt || trade.updatedAt;
             if (!tradeId) continue;
+            // Tick PER-EXCHANGE state (RiskProfileState) — this is what
+            // OrderService.placeOrderWithRiskProfile reads when sizing the
+            // next order. The legacy single-exchange RiskProfile.* fields
+            // are mirrored in parallel for back-compat with anything still
+            // reading them.
+            const User = require('../models/User');
+            const userDoc = await User.findById(req.user._id).select('activeExchange').lean();
+            const exchangeForTick = userDoc?.activeExchange || 'bybit';
+            await riskProfileService.processNewTradeResultForExchange(
+              req.user._id, exchangeForTick, result, String(tradeId)
+            );
+            // Mirror to legacy fields so any code still reading
+            // RiskProfile.currentrisk sees the same number.
             await riskProfileService.processNewTradeResult(req.user._id, result, String(tradeId));
           }
         } catch (syncError) {

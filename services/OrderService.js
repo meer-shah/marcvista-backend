@@ -179,6 +179,13 @@ class OrderService {
       if (state.isFirstTrade) {
         state.isFirstTrade = false;
         await state.save();
+        // Mirror to the legacy RiskProfile field so the FRONTEND's adjusted-
+        // risk formula (which still reads RiskProfile.isFirstTrade) flips
+        // away from the initialRiskPerTrade fallback.
+        if (riskProfile.isFirstTrade) {
+          riskProfile.isFirstTrade = false;
+          await riskProfile.save();
+        }
         data.adjustedRisk = state.currentrisk || riskProfile.initialRiskPerTrade;
       }
 
