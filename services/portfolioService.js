@@ -141,15 +141,26 @@ class PortfolioService {
    */
   async getMyTrades(userId, options = {}) {
     const { clearedAt = null } = options;
+    // Include Pending so freshly-placed trades surface in the UI immediately
+    // (the Trade Breakdown shows them with a yellow badge). They auto-morph
+    // into Win/Loss once the closed-pnl sync picks up the close.
     const query = {
       user: userId,
-      outcome: { $in: ['Win', 'Loss'] },
+      outcome: { $in: ['Win', 'Loss', 'Pending'] },
     };
     if (clearedAt) {
-      query.closedAt = { $gt: new Date(clearedAt) };
+      // Don't apply the cleared-cutoff to Pending (closedAt is null), only
+      // to closed trades — otherwise a fresh order placed after Clear History
+      // would be hidden until close.
+      query.$or = [
+        { outcome: 'Pending' },
+        { closedAt: { $gt: new Date(clearedAt) } },
+      ];
+      delete query.outcome;
+      query.outcome = { $in: ['Win', 'Loss', 'Pending'] };
     }
     return Trade.find(query)
-      .sort({ closedAt: -1, placedAt: -1 })
+      .sort({ outcome: 1, closedAt: -1, placedAt: -1 }) // Pending first
       .populate('riskProfile', 'title')
       .lean();
   }
