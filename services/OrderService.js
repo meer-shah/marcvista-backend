@@ -175,18 +175,25 @@ class OrderService {
         }
       }
 
-      // Mark first trade as consumed on this exchange — subsequent orders compound.
-      if (state.isFirstTrade) {
+      // First trade on this exchange — ALWAYS use initialRiskPerTrade and
+      // snap the state back to it (no drift). Then flip isFirstTrade off on
+      // both stores so future trades compound from here.
+      if (state.isFirstTrade || riskProfile.isFirstTrade) {
+        const initial = Number(riskProfile.initialRiskPerTrade) || 0;
         state.isFirstTrade = false;
+        state.currentrisk = initial;
+        state.previousrisk = 0;
+        state.consecutiveWins = 0;
+        state.consecutiveLosses = 0;
         await state.save();
-        // Mirror to the legacy RiskProfile field so the FRONTEND's adjusted-
-        // risk formula (which still reads RiskProfile.isFirstTrade) flips
-        // away from the initialRiskPerTrade fallback.
-        if (riskProfile.isFirstTrade) {
-          riskProfile.isFirstTrade = false;
-          await riskProfile.save();
-        }
-        data.adjustedRisk = state.currentrisk || riskProfile.initialRiskPerTrade;
+        // Mirror to legacy so the UI's calculateAdjustedRisk returns the same.
+        riskProfile.isFirstTrade = false;
+        riskProfile.currentrisk = initial;
+        riskProfile.previousrisk = 0;
+        riskProfile.consecutiveWins = 0;
+        riskProfile.consecutiveLosses = 0;
+        await riskProfile.save();
+        data.adjustedRisk = initial;
       }
 
       // 7. Calculate FEE-INCLUSIVE position size.

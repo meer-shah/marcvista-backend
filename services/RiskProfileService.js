@@ -176,6 +176,27 @@ class RiskProfileService {
       profile.goals = [];
       await profile.save();
 
+      // Reset the per-exchange runtime state too — otherwise it carries the
+      // drifted counters from the previous activation and OrderService sizes
+      // orders against stale numbers.
+      try {
+        const RiskProfileState = require('../models/RiskProfileState');
+        await RiskProfileState.updateMany(
+          { user: userId, riskProfile: profile._id },
+          {
+            $set: {
+              currentrisk: profile.initialRiskPerTrade,
+              previousrisk: 0,
+              consecutiveWins: 0,
+              consecutiveLosses: 0,
+              isFirstTrade: true,
+              lastProcessedTradeId: null,
+              activatedAt: new Date(),
+            },
+          }
+        );
+      } catch { /* state collection may not exist on first boot — non-fatal */ }
+
       return { message: 'Risk profile activated successfully', data: profile };
     } else {
       // Deactivating a profile — refuse if this is the user's only profile
@@ -436,6 +457,18 @@ class RiskProfileService {
     state.lastProcessedTradeId = tradeId;
     state.isFirstTrade = false;
     await state.save();
+
+    // Mirror to LEGACY RiskProfile fields so anything still reading them
+    // (the frontend's calculateAdjustedRisk reads `currentrisk` + `isFirstTrade`
+    // off the RiskProfile doc returned by getActive) sees the same number.
+    // This converges both stores on every tick — no more drift.
+    profile.previousrisk = profile.currentrisk;
+    profile.currentrisk = newRisk;
+    profile.consecutiveWins = nextWins;
+    profile.consecutiveLosses = nextLosses;
+    profile.lastProcessedTradeId = tradeId;
+    profile.isFirstTrade = false;
+    await profile.save();
     return true;
   }
 }
