@@ -1,5 +1,25 @@
 const { http_request, clearCredentialCache } = require('../config/bybitConfig');
+const { getBroker, getBrokerContext } = require('../services/brokers');
 const logger = require('../utils/logger');
+
+/**
+ * Resolve the broker + ctx for the user's currently-active exchange.
+ * Tolerant of missing user / missing credentials — caller may treat null
+ * return as "show empty list" and surface a friendly error.
+ */
+async function getActiveBrokerForUser(req) {
+  try {
+    const User = require('../models/User');
+    const user = await User.findById(req.user._id).select('activeExchange').lean();
+    const exchange = user?.activeExchange || 'bybit';
+    const broker = getBroker(exchange);
+    const ctx = await getBrokerContext(req.user._id, exchange);
+    return { broker, ctx, exchange };
+  } catch (err) {
+    logger.warn('getActiveBrokerForUser failed', { message: err?.message });
+    return null;
+  }
+}
 const {
   calculateTradeMetrics,
   findBestAndWorstTrade,
@@ -200,35 +220,13 @@ function aggregatePartialFills(rawTrades) {
  */
 const getOrderListf = async (req, res) => {
   try {
-    const response = await http_request(
-      "/v5/order/realtime",
-      "GET",
-      "category=linear&settleCoin=USDT&accountType=UNIFIED",
-      "Get Order List (Realtime)",
-      req.user._id
-    );
-    let orders = response?.result?.list || [];
-
-    orders = orders.map(order => ({
-      _id: order.orderId,
-      symbol: order.symbol,
-      qty: order.qty,
-      quantity: order.qty,
-      price: order.price,
-      stopLoss: order.stopLoss || '',
-      takeProfit: order.takeProfit || '',
-      side: order.side,
-      type: order.orderType,
-      status: order.orderStatus,
-      createdAt: order.createdTime ? parseInt(order.createdTime) : null,
-      createdTime: order.createdTime,
-      ...order
-    })).filter(order => !order.stopOrderType);
-
-    logger.info('orders fetched', { count: orders.length });
+    const ab = await getActiveBrokerForUser(req);
+    if (!ab) return res.json([]);
+    const orders = await ab.broker.getPendingOrders(ab.ctx);
+    logger.info('orders fetched', { exchange: ab.exchange, count: orders.length });
     res.json(orders);
   } catch (error) {
-    logger.error('Error in getOrderListf', error);
+    logger.error('Error in getOrderListf', { message: error?.message });
     res.json([]);
   }
 };
@@ -238,33 +236,12 @@ const getOrderListf = async (req, res) => {
  */
 const getPositionInfof = async (req, res) => {
   try {
-    const symbol = req.query?.symbol;
-    const query = `category=linear&settleCoin=USDT${symbol ? `&symbol=${symbol}` : ''}`;
-    const response = await http_request(
-      "/v5/position/list",
-      "GET",
-      query,
-      "Get Position Info",
-      req.user._id
-    );
-    let positions = response?.result?.list || [];
-
-    positions = positions.map(pos => ({
-      symbol: pos.symbol,
-      size: pos.size,
-      positionValue: pos.positionValue,
-      avgEntryPrice: pos.avgPrice,
-      marketPrice: pos.markPrice,
-      unrealisedPnL: pos.unrealisedPnl,
-      takeProfit: pos.takeProfit || '',
-      stopLoss: pos.stopLoss || '',
-      side: pos.side,
-      ...pos
-    }));
-
+    const ab = await getActiveBrokerForUser(req);
+    if (!ab) return res.json([]);
+    const positions = await ab.broker.getPositions(ab.ctx, req.query?.symbol);
     res.json(positions);
   } catch (error) {
-    logger.error('Error in getPositionInfof', error);
+    logger.error('Error in getPositionInfof', { message: error?.message });
     res.json([]);
   }
 };
@@ -366,15 +343,16 @@ const gettransactionlog = async (req, res) => {
  */
 const getClosedPnlf = async (req, res) => {
   try {
-    const response = await http_request(
-      "/v5/position/closed-pnl",
-      "GET",
-      "category=linear",
-      "Get Closed PnL",
-      req.user._id
-    );
-
-    let trades = response?.result?.list || [];
+    // Active-exchange aware. The sync logic below was originally Bybit-only;
+    // every broker's getClosedPnl() returns rows in Bybit's ClosedPnlRow shape
+    // (orderId/orderLinkId/closedPnl/cumExecFee/updatedTime), so downstream
+    // aggregation + matching + persistence keeps working without changes.
+    const ab = await getActiveBrokerForUser(req);
+    if (!ab) {
+      return res.json({ trades: [], metrics: {}, bestTrade: { closedPnl: 0 }, worstTrade: { closedPnl: 0 }, bestCoins: [], worstCoins: [] });
+    }
+    const activeExchange = ab.exchange;
+    let trades = await ab.broker.getClosedPnl(ab.ctx);
 
     // Collapse partial fills of the same order into one logical trade.
     // Bybit returns one row per fill; without this, a single order that fills
@@ -452,10 +430,12 @@ const getClosedPnlf = async (req, res) => {
 
           const unprocessedTrades = tradesAfterActivation.slice(lastProcessedIdx + 1);
 
-          // Count existing trades once for tradeNumber assignment
+          // Count existing trades once for tradeNumber assignment — scope by
+          // active exchange so Bybit tradeNumbers don't collide with Binance ones.
           let externalTradeOffset = await Trade.countDocuments({
             user: req.user._id,
             riskProfile: activeProfile._id,
+            exchange: activeExchange,
             placedAt: { $gte: activeProfile.activatedAt || activeProfile.createdAt },
           });
 
@@ -486,18 +466,21 @@ const getClosedPnlf = async (req, res) => {
             candidateOrderLinkIds.length
               ? Trade.find({
                   user: req.user._id,
+                  exchange: activeExchange,
                   orderLinkId: { $in: candidateOrderLinkIds },
                   outcome: 'Pending',
                 }).lean()
               : Promise.resolve([]),
             Trade.find({
               user: req.user._id,
+              exchange: activeExchange,
               riskProfile: activeProfile._id,
               outcome: 'Pending',
             }).sort({ placedAt: 1 }).lean(),
             candidateOrderLinkIds.length
               ? Trade.find({
                   user: req.user._id,
+                  exchange: activeExchange,
                   orderLinkId: { $in: candidateOrderLinkIds },
                   outcome: { $in: ['Win', 'Loss'] },
                   source: 'app',
@@ -505,6 +488,7 @@ const getClosedPnlf = async (req, res) => {
               : Promise.resolve([]),
             Trade.find({
               user: req.user._id,
+              exchange: activeExchange,
               source: 'app',
               outcome: { $in: ['Win', 'Loss'] },
               closedAt: { $gte: recentSinceDate },
@@ -700,6 +684,7 @@ const getClosedPnlf = async (req, res) => {
                     riskProfile: activeProfile._id,
                     activatedAt: activeProfile.activatedAt || activeProfile.createdAt,
                     tradeNumber: externalTradeOffset,
+                    exchange: activeExchange,
                     symbol: trade.symbol,
                     side: openingSide,
                     category: 'linear',
@@ -769,9 +754,7 @@ const getClosedPnlf = async (req, res) => {
           // The sync therefore looks up the matching Trade._id and uses it as
           // the tradeId. If we used Bybit's orderId here, the placement path
           // would not see it as already-processed and would double-tick.
-          const User = require('../models/User');
-          const userDoc = await User.findById(req.user._id).select('activeExchange').lean();
-          const exchangeForTick = userDoc?.activeExchange || 'bybit';
+          const exchangeForTick = activeExchange;
           for (const trade of unprocessedTrades) {
             const pnl = parseFloat(trade.closedPnl);
             if (isNaN(pnl)) continue;
@@ -822,18 +805,13 @@ const getClosedPnlf = async (req, res) => {
  */
 const showusdtbalance = async (req, res) => {
   try {
-    const response = await http_request(
-      "/v5/account/wallet-balance",
-      "GET",
-      "accountType=UNIFIED",
-      "Get Balance",
-      req.user._id
-    );
-    const balance = getUsdtBalance(response);
+    const ab = await getActiveBrokerForUser(req);
+    if (!ab) return res.status(500).json({ error: 'No active exchange / credentials' });
+    const balance = await ab.broker.getUsdtBalance(ab.ctx);
     res.json({ balance });
   } catch (error) {
-    logger.error('Error in showusdtbalance', error);
-    res.status(500).json({ error: "Failed to get balance" });
+    logger.error('Error in showusdtbalance', { message: error?.message });
+    res.status(500).json({ error: 'Failed to get balance' });
   }
 };
 
