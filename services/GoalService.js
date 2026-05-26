@@ -1,135 +1,141 @@
 /**
  * GoalService — pure business logic for goal management.
  *
- * No Express req/res objects — fully testable.
- * Goals live as sub-documents inside the active RiskProfile.
+ * Goals are USER-GLOBAL. They live on the User document, not on individual
+ * RiskProfile docs, so switching risk profiles or exchanges doesn't change
+ * which goals the user is working toward.
+ *
+ * Migration: first call per user copies any existing goals off the legacy
+ * RiskProfile sub-array onto the User doc so historical setups carry over.
  */
+const User = require('../models/User');
 const RiskProfile = require('../models/riskprofilemodal');
-const { http_request } = require('../config/bybitConfig');
+const Trade = require('../models/Trade');
 const logger = require('../utils/logger');
 
+const MAX_GOALS_PER_USER = 1;
+
+async function _loadUserWithBackfill(userId) {
+  const user = await User.findById(userId).select('goals');
+  if (!user) return null;
+  // One-time backfill: if the user has no global goals yet but a legacy
+  // per-profile goal exists, pull the first one over so they don't lose it.
+  if (!user.goals || user.goals.length === 0) {
+    try {
+      const profileWithGoals = await RiskProfile.findOne({
+        user: userId,
+        goals: { $exists: true, $not: { $size: 0 } },
+      }).select('goals').lean();
+      const legacy = profileWithGoals?.goals?.[0];
+      if (legacy) {
+        user.goals = [{
+          goalType: legacy.goalType,
+          goalAmount: legacy.goalAmount,
+          createdAt: legacy.createdAt || new Date(),
+        }];
+        await user.save();
+      }
+    } catch (err) {
+      logger.warn('Goal backfill from legacy RiskProfile failed', { message: err?.message });
+    }
+  }
+  return user;
+}
+
 class GoalService {
-  /**
-   * Add a goal to the active risk profile.
-   */
   async addGoal(userId, { goalType, goalAmount }) {
     if (!goalType || !goalAmount) {
       return { error: 'Goal type and amount are required.', status: 400 };
     }
+    const user = await _loadUserWithBackfill(userId);
+    if (!user) return { error: 'User not found.', status: 404 };
 
-    const activeProfile = await RiskProfile.findOne({ user: userId, ison: true });
-    if (!activeProfile) {
-      return { data: { goals: [] } };
+    if ((user.goals?.length || 0) >= MAX_GOALS_PER_USER) {
+      return { error: 'Only one goal is allowed. Delete or update the existing one.', status: 400 };
     }
-
-    if (!activeProfile.goals) {
-      activeProfile.goals = [];
-    }
-
-    if (activeProfile.goals.length > 0) {
-      return { error: 'Only one goal is allowed per profile. Please delete or update the existing one.', status: 400 };
-    }
-
-    const newGoal = { goalType, goalAmount, createdAt: new Date() };
-    activeProfile.goals.push(newGoal);
-    await activeProfile.save();
+    user.goals.push({ goalType, goalAmount, createdAt: new Date() });
+    await user.save();
 
     return {
       message: 'Goal added successfully.',
-      data: { goal: activeProfile.goals[activeProfile.goals.length - 1] },
+      data: { goal: user.goals[user.goals.length - 1] },
       status: 201,
     };
   }
 
-  /**
-   * Get all goals with progress tracking.
-   */
   async getGoals(userId) {
-    const activeProfile = await RiskProfile.findOne({ user: userId, ison: true });
-    let goals = activeProfile?.goals || [];
-
+    const user = await _loadUserWithBackfill(userId);
+    let goals = user?.goals || [];
     if (goals.length === 0) {
       return { data: { goals: [] } };
     }
 
-    // Fetch all closed trades once (for progress calculation)
+    // Progress = sum of realised PnL across the canonical Trade collection
+    // since the goal was created. Reads from our own DB (not the exchange),
+    // so every venue with synced trades contributes — Bybit, Binance, MEXC,
+    // etc. — and the math survives offline/exchange downtime.
+    const earliestGoalStart = goals.reduce(
+      (min, g) => Math.min(min, new Date(g.createdAt).getTime() || Date.now()),
+      Date.now()
+    );
     let allTrades = [];
     try {
-      const pnlResponse = await http_request(
-        '/v5/position/closed-pnl',
-        'GET',
-        'category=linear',
-        'Get Closed PnL for Goal Progress',
-        userId
-      );
-      allTrades = pnlResponse?.result?.list || [];
+      allTrades = await Trade.find({
+        user: userId,
+        outcome: { $in: ['Win', 'Loss'] },
+        closedAt: { $gte: new Date(earliestGoalStart) },
+      }).select('pnl closedAt').lean();
     } catch (error) {
       logger.error('Failed to fetch trades for goal progress', error);
-      // Continue without progress data — goals will have 0 progress
     }
 
-    // Enrich each goal with actualProfit and progress
     goals = goals.map((goal) => {
       const goalStart = new Date(goal.createdAt).getTime();
-      const relevantTrades = allTrades.filter((trade) => {
-        const tradeCloseTime = parseInt(trade.updatedTime);
-        return tradeCloseTime >= goalStart;
+      const relevantTrades = allTrades.filter((t) => {
+        const closedMs = t.closedAt ? new Date(t.closedAt).getTime() : 0;
+        return closedMs >= goalStart;
       });
-
-      const actualProfit = relevantTrades.reduce((sum, t) => sum + parseFloat(t.closedPnl || 0), 0);
+      const actualProfit = relevantTrades.reduce((sum, t) => sum + (Number(t.pnl) || 0), 0);
       const progress = goal.goalAmount > 0 ? (actualProfit / goal.goalAmount) * 100 : 0;
-
       return { ...goal.toObject(), actualProfit, progress };
     });
 
     return { data: { goals } };
   }
 
-  /**
-   * Update a goal by ID.
-   */
   async updateGoal(userId, { goalId, goalType, goalAmount }) {
     if (!goalId || (!goalType && !goalAmount)) {
       return { error: 'Invalid update request.', status: 400 };
     }
+    const user = await _loadUserWithBackfill(userId);
+    if (!user) return { error: 'User not found.', status: 404 };
 
-    const activeProfile = await RiskProfile.findOne({ user: userId, ison: true });
-    if (!activeProfile) {
-      return { data: { goals: [] } };
-    }
-
-    const goal = activeProfile.goals.id(goalId);
+    const goal = user.goals.id(goalId);
     if (!goal) return { error: 'Goal not found.', status: 404 };
 
     if (goalType) goal.goalType = goalType;
     if (goalAmount) goal.goalAmount = goalAmount;
+    await user.save();
 
-    await activeProfile.save();
     return { message: 'Goal updated successfully.', data: { goal } };
   }
 
-  /**
-   * Delete a goal by ID.
-   */
   async deleteGoal(userId, goalId) {
     if (!goalId) {
       return { error: 'Goal ID is required.', status: 400 };
     }
+    const user = await _loadUserWithBackfill(userId);
+    if (!user) return { error: 'User not found.', status: 404 };
 
-    const activeProfile = await RiskProfile.findOne({ user: userId, ison: true });
-    if (!activeProfile) {
-      return { data: { goals: [] } };
-    }
-
-    const goal = activeProfile.goals.id(goalId);
+    const goal = user.goals.id(goalId);
     if (!goal) return { error: 'Goal not found.', status: 404 };
 
-    activeProfile.goals.pull(goalId);
-    await activeProfile.save();
+    user.goals.pull(goalId);
+    await user.save();
 
     return {
       message: 'Goal deleted successfully.',
-      data: { goals: activeProfile.goals },
+      data: { goals: user.goals },
     };
   }
 }

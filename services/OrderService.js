@@ -371,6 +371,30 @@ class OrderService {
   }
 
   /**
+   * Per-symbol fee rate for the user on their active exchange. Returns
+   * { maker, taker } as decimals (0.00055 = 0.055%). Lets the front-end
+   * sizer use the actual rate for the symbol (Bybit XAUUSDT ≈ 0.028%,
+   * BTCUSDT ≈ 0.055%) instead of one hardcoded constant.
+   */
+  async getFeeRates(userId, symbol, exchange = null) {
+    const { broker, ctx } = await this._getBroker(userId, exchange);
+    if (typeof broker.getFeeRatesForSymbol !== 'function') return null;
+    return broker.getFeeRatesForSymbol(ctx, symbol);
+  }
+
+  /**
+   * Fetch the user's CURRENT leverage on a symbol (independent of any open
+   * position). Brokers that don't expose this return null — the controller
+   * surfaces that as 200 + { leverage: null } so the UI can fall back to its
+   * existing position-derived sync.
+   */
+  async getLeverage(userId, symbol, exchange = null) {
+    const { broker, ctx } = await this._getBroker(userId, exchange);
+    if (typeof broker.getLeverage !== 'function') return null;
+    return broker.getLeverage(ctx, symbol);
+  }
+
+  /**
    * Set leverage for a symbol on the user's active exchange.
    */
   async setLeverage(userId, symbol, buyLeverage, sellLeverage, exchange = null) {

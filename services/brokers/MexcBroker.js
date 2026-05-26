@@ -127,23 +127,105 @@ class MexcBroker extends IBroker {
   }
 
   async amendOrder(ctx, req) {
-    const body = {
-      orderId: Number(req.orderId),
-      price: req.price != null ? Number(req.price) : undefined,
-      vol: req.qty != null ? Number(req.qty) : undefined,
-    };
-    const r = await this._signedRequest(ctx, 'POST', '/api/v1/private/order/change_margin', 'Amend Order', body);
-    return { retCode: 0, retMsg: 'OK', _raw: r };
+    // MEXC contract has no edit-in-place endpoint for limit orders — the
+    // closest match is cancel + re-submit. (The previous `change_margin` call
+    // here was wrong: that endpoint adjusts position margin, not order price
+    // or quantity.) Read existing order to preserve fields the caller didn't
+    // touch, cancel it, then submit a new one with the merged values.
+    if (!req.orderId) throw new Error('MEXC amendOrder requires orderId');
+    let original = null;
+    try {
+      const lookup = await this._signedRequest(
+        ctx, 'GET', '/api/v1/private/order/get', 'Get Order',
+        { order_id: Number(req.orderId) }
+      );
+      original = lookup?.data || null;
+    } catch { /* not fatal — fall back to whatever the caller supplied */ }
+
+    await this.cancelOrder(ctx, { orderId: req.orderId });
+
+    const resubmit = await this.placeOrder(ctx, {
+      symbol: req.symbol || (original ? MexcBroker.toCanonicalSymbol(original.symbol) : undefined),
+      side: req.side || (original?.side === 1 || original?.side === 4 ? 'Buy' : 'Sell'),
+      qty: req.qty != null ? req.qty : original?.vol,
+      price: req.price != null ? req.price : original?.price,
+      orderType: req.orderType || (original?.orderType === 5 ? 'Market' : 'Limit'),
+      orderLinkId: req.orderLinkId || original?.externalOid,
+      stopLoss: req.stopLoss ?? original?.stopLossPrice,
+      takeProfit: req.takeProfit ?? original?.takeProfitPrice,
+    });
+    return { retCode: resubmit.retCode, retMsg: resubmit.retMsg, result: resubmit.result, _raw: resubmit._raw };
   }
 
-  async setLeverage(ctx, { symbol, buyLeverage }) {
-    const body = {
-      symbol: MexcBroker.toExchangeSymbol(symbol),
-      leverage: Number(buyLeverage),
-      openType: 2, // cross
-    };
-    const r = await this._signedRequest(ctx, 'POST', '/api/v1/private/position/change_leverage', 'Set Leverage', body);
-    return { retCode: r?.code === 0 ? 0 : -1, retMsg: r?.msg || 'OK', _raw: r };
+  async setLeverage(ctx, { symbol, buyLeverage, sellLeverage }) {
+    // MEXC contract requires `positionType` (1=long, 2=short) on the
+    // change_leverage endpoint when no existing position is being amended.
+    // It also sets leverage PER DIRECTION, so to mirror Bybit/Binance's
+    // "one call sets both" semantics we fire one request per side.
+    const native = MexcBroker.toExchangeSymbol(symbol);
+    const longLev = Number(buyLeverage);
+    const shortLev = Number(sellLeverage ?? buyLeverage);
+    const call = (positionType, leverage) => this._signedRequest(
+      ctx, 'POST', '/api/v1/private/position/change_leverage', 'Set Leverage',
+      { symbol: native, leverage, openType: 2, positionType }
+    );
+    const results = await Promise.allSettled([call(1, longLev), call(2, shortLev)]);
+
+    // Treat "already at this leverage" responses as success — MEXC returns
+    // these on a no-op change rather than erroring.
+    const ok = (r) => r.status === 'fulfilled' && (r.value?.code === 0 || r.value?.success === true);
+    const longOk = ok(results[0]);
+    const shortOk = ok(results[1]);
+
+    if (longOk && shortOk) {
+      return { retCode: 0, retMsg: 'OK', _raw: results.map(r => r.value || r.reason) };
+    }
+    // Surface whichever side failed with the actual MEXC message so the
+    // toast tells the user something useful instead of "OK".
+    const failure = results.find(r => !ok(r));
+    const msg = failure?.value?.message || failure?.value?.msg ||
+                failure?.reason?.message || 'MEXC leverage change rejected';
+    return { retCode: -1, retMsg: msg, _raw: results.map(r => r.value || r.reason) };
+  }
+
+  /**
+   * Per-symbol fee rate. MEXC publishes maker/taker on the public contract
+   * detail endpoint — same number every user sees (volume tiers apply but
+   * the per-contract rate is the baseline). Avoids burning the rate-limited
+   * private "fee details" endpoint on what's effectively static data.
+   */
+  async getFeeRatesForSymbol(ctx, symbol) {
+    try {
+      const native = MexcBroker.toExchangeSymbol(symbol);
+      const r = await this._publicGet(ctx.mode, '/api/v1/contract/detail', 'Get Fee Rate', { symbol: native });
+      const it = r?.data;
+      const maker = parseFloat(it?.makerFeeRate);
+      const taker = parseFloat(it?.takerFeeRate);
+      if (!Number.isFinite(maker) || !Number.isFinite(taker)) return MexcBroker.feeRates();
+      return { maker, taker };
+    } catch (err) {
+      logger.warn('[MEXC] getFeeRatesForSymbol failed', { symbol, message: err?.message });
+      return MexcBroker.feeRates();
+    }
+  }
+
+  async getLeverage(ctx, symbol) {
+    try {
+      const native = MexcBroker.toExchangeSymbol(symbol);
+      const r = await this._signedRequest(
+        ctx, 'GET', '/api/v1/private/position/leverage', 'Get Leverage',
+        { symbol: native }
+      );
+      // MEXC returns an array with one entry per positionType (long, short).
+      // Each entry: { leverage, openType, positionType, ... }. Cross mode
+      // shares leverage across sides, so picking the first non-zero value
+      // matches what the MEXC UI displays as "current leverage".
+      const rows = Array.isArray(r?.data) ? r.data : (r?.data ? [r.data] : []);
+      const lev = rows.map(row => Number(row?.leverage)).find(n => Number.isFinite(n) && n > 0);
+      return Number.isFinite(lev) && lev > 0 ? lev : null;
+    } catch {
+      return null;
+    }
   }
 
   async switchMarginMode() {

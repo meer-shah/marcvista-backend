@@ -24,6 +24,18 @@ const DEMO_BASE = 'https://api-demo.bybit.com';
 const RECV_WINDOW = '5000';
 const HTTP_TIMEOUT = 8000;
 
+// Per-symbol fee overrides for cases where /v5/account/fee-rate doesn't
+// return useful data — primarily Bybit demo (api-demo.bybit.com), which
+// rejects the endpoint with retCode 10001 + empty retMsg. Values seeded from
+// empirical paid-fee data on actual fills, not from documentation (Bybit's
+// public fee table doesn't disclose the gold-specific rate).
+//   - XAUUSDT taker = 0.028%  →  observed on 2026-05-26 XAUUSDT fills
+//   - Crypto perps fall through to BybitBroker.feeRates() (maker 0.02% / taker 0.055%)
+const BYBIT_SYMBOL_FEE_OVERRIDES = {
+  XAUUSDT: { maker: 0.0001, taker: 0.00028 },
+  XAGUSDT: { maker: 0.0001, taker: 0.00028 },
+};
+
 class BybitBroker extends IBroker {
   static get id() { return 'bybit'; }
   static get label() { return 'Bybit'; }
@@ -40,7 +52,17 @@ class BybitBroker extends IBroker {
     const baseUrl = this._baseUrl(ctx.mode);
     const timestamp = Date.now().toString();
     const isGet = method === 'GET';
-    const queryString = isGet ? (payload || '') : '';
+    // Accept payload as either a pre-formatted query string (legacy callers)
+    // OR a plain object (preferred). Object → URLSearchParams. JavaScript
+    // coercing an object straight into the signature string produced
+    // "[object Object]" and Bybit rejected with retCode 10004 (signature
+    // error). New callers should pass objects; old string callers still work.
+    const toQs = (p) => {
+      if (!p) return '';
+      if (typeof p === 'string') return p;
+      return new URLSearchParams(p).toString();
+    };
+    const queryString = isGet ? toQs(payload) : '';
     const body = isGet ? '' : JSON.stringify(payload || {});
     const sign = crypto
       .createHmac('sha256', secret)
@@ -120,6 +142,62 @@ class BybitBroker extends IBroker {
 
   async switchMarginMode(ctx, req) {
     return this._signedRequest(ctx, 'POST', '/v5/position/switch-isolated', 'Switch Margin Mode', req);
+  }
+
+  /**
+   * Per-symbol fee rate for THIS user. Bybit returns different rates for
+   * different symbol classes — XAUUSDT is roughly 0.028% taker vs 0.055%
+   * for crypto perps — and the user's VIP tier discounts on top.
+   * Single hardcoded constant in the sizer leaves money on the table on
+   * tight-SL gold/forex-perp setups; this fetches the real rate.
+   */
+  async getFeeRatesForSymbol(ctx, symbol) {
+    try {
+      // Try with the symbol filter first. Some account configurations reject
+      // the symbol param with retCode 10001 — in that case we retry with just
+      // category=linear (returns the whole list, we pick our symbol).
+      let r = await this._signedRequest(
+        ctx, 'GET', '/v5/account/fee-rate', 'Get Fee Rate',
+        { category: 'linear', symbol }
+      ).catch(err => ({ _err: err }));
+      if (r?._err || (r?.retCode && r.retCode !== 0)) {
+        logger.info('[Bybit] fee-rate with symbol failed, retrying without symbol filter', {
+          symbol, firstRetCode: r?.retCode, firstRetMsg: r?.retMsg,
+        });
+        r = await this._signedRequest(
+          ctx, 'GET', '/v5/account/fee-rate', 'Get Fee Rate (all)',
+          { category: 'linear' }
+        );
+      }
+      // Loud log — full raw response. Demo (api-demo.bybit.com) may not
+      // support /v5/account/fee-rate at all; main (api.bybit.com) should.
+      logger.info('[Bybit] fee-rate response RAW', {
+        symbol,
+        mode: ctx.mode,
+        baseUrl: this._baseUrl(ctx.mode),
+        full: r,
+      });
+      const list = r?.result?.list || [];
+      const row = list.find(x => x.symbol === symbol) || list[0];
+      if (row) {
+        const maker = parseFloat(row.makerFeeRate);
+        const taker = parseFloat(row.takerFeeRate);
+        if (Number.isFinite(maker) && Number.isFinite(taker)) {
+          return { maker, taker, _debug: { source: 'bybit /v5/account/fee-rate', raw: row } };
+        }
+      }
+      // API didn't return usable rates — fall through to override map.
+      const override = BYBIT_SYMBOL_FEE_OVERRIDES[symbol];
+      if (override) {
+        return { ...override, _debug: { source: 'override map (demo /fee-rate unsupported)', raw: r } };
+      }
+      return { ...BybitBroker.feeRates(), _debug: { source: 'static defaults', raw: r } };
+    } catch (err) {
+      logger.warn('[Bybit] getFeeRatesForSymbol failed', { symbol, message: err?.message });
+      const override = BYBIT_SYMBOL_FEE_OVERRIDES[symbol];
+      if (override) return { ...override, _debug: { source: 'override map (request error)', message: err?.message } };
+      return { ...BybitBroker.feeRates(), _debug: { reason: 'request error', message: err?.message } };
+    }
   }
 
   async getUsdtBalance(ctx) {

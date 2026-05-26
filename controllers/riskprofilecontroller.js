@@ -81,6 +81,26 @@ const getActiveRiskProfile = async (req, res) => {
   }
 };
 
+// Get active risk profile merged with its per-exchange runtime state.
+// Query: ?exchange=<id>  (defaults to user's currently-active exchange).
+const getActiveRiskState = async (req, res) => {
+  try {
+    const User = require('../models/User');
+    const user = await User.findById(req.user._id).select('activeExchange').lean();
+    const exchange = String(req.query?.exchange || user?.activeExchange || 'bybit').toLowerCase();
+    const allowed = ['bybit', 'binance', 'okx', 'bitget', 'mexc'];
+    if (!allowed.includes(exchange)) {
+      return res.status(400).json({ message: `Unsupported exchange: ${exchange}` });
+    }
+    const merged = await service.getActiveStateForExchange(req.user._id, exchange);
+    if (!merged) return res.status(404).json({ message: 'No active risk profile found' });
+    res.status(200).json(merged);
+  } catch (error) {
+    logger.error('Error fetching active risk state', error);
+    res.status(500).json({ message: 'Error fetching active risk state' });
+  }
+};
+
 // Activate/deactivate a risk profile
 const activateprofile = async (req, res) => {
   try {
@@ -148,6 +168,7 @@ module.exports = {
   updateRiskProfile,
   activateprofile,
   getActiveRiskProfile,
+  getActiveRiskState,
   resetdeault,
   resetRiskState,
 };

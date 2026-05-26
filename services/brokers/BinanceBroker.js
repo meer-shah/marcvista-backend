@@ -12,7 +12,9 @@
  *   on the entry). To match Bybit's "one entry with TP+SL" UX we place the
  *   entry then immediately submit a TAKE_PROFIT_MARKET and STOP_MARKET as
  *   `reduceOnly` triggers on the position. Same effect, three API calls.
- * - Demo: https://testnet.binancefuture.com (separate keys from production).
+ * - Demo: https://demo-fapi.binance.com (Binance Futures Demo Trading —
+ *   separate keys from production AND from the older testnet.binancefuture.com
+ *   sandbox; keys are NOT interchangeable across the two demo environments).
  */
 const axios = require('axios');
 const crypto = require('crypto');
@@ -21,9 +23,17 @@ const { getExchangeCredentials } = require('../../config/credentials');
 const logger = require('../../utils/logger');
 
 const REAL_BASE = 'https://fapi.binance.com';
-const DEMO_BASE = 'https://testnet.binancefuture.com';
-const HTTP_TIMEOUT = 8000;
-const RECV_WINDOW = 5000;
+const DEMO_BASE = 'https://demo-fapi.binance.com';
+// 20s per-request — demo-fapi.binance.com is noticeably slower than
+// production fapi. At 8s we routinely hit Binance's own -1007 timeout
+// ("Send status unknown; execution status unknown"), which leaves the order
+// in an indeterminate state on the exchange.
+const HTTP_TIMEOUT = 20000;
+// recvWindow tells Binance "reject this request if it's older than X ms when
+// it arrives." 5s is fine for low-latency paths; on demo-fapi the request
+// itself can take longer in flight, so bump to match HTTP_TIMEOUT to avoid
+// spurious -1021 (timestamp-out-of-range) errors.
+const RECV_WINDOW = 15000;
 
 class BinanceBroker extends IBroker {
   static get id() { return 'binance'; }
@@ -129,19 +139,37 @@ class BinanceBroker extends IBroker {
         result._triggerWarning = (result._triggerWarning ? result._triggerWarning + ' | ' : '') + `${label}: ${msg}`;
       }
     };
-    if (req.stopLoss != null) await attachTrigger('Create SL Trigger', 'STOP_MARKET', req.stopLoss);
-    if (req.takeProfit != null) await attachTrigger('Create TP Trigger', 'TAKE_PROFIT_MARKET', req.takeProfit);
+    // Run SL and TP in parallel so the total client wait is one round-trip,
+    // not two. Failures are accumulated onto result._triggerWarning by
+    // attachTrigger itself, so we don't need try/catch out here.
+    const triggers = [];
+    if (req.stopLoss != null) triggers.push(attachTrigger('Create SL Trigger', 'STOP_MARKET', req.stopLoss));
+    if (req.takeProfit != null) triggers.push(attachTrigger('Create TP Trigger', 'TAKE_PROFIT_MARKET', req.takeProfit));
+    if (triggers.length) await Promise.all(triggers);
     return result;
   }
 
   _explainTriggerError(err) {
     const code = err?.binanceCode;
+    const raw = err?.message || 'Trigger order failed';
+    // Always include the Binance error code so the user (and we) can diagnose
+    // when the canned translation is wrong. Past message hardcoded "testnet"
+    // and a TradFi-Perps explanation that only applies to a subset of cases.
+    const suffix = code != null ? ` (Binance code ${code})` : '';
     if (code === -4120 || code === -4411) {
-      return 'Binance testnet requires you to accept the TradFi-Perps agreement before SL/TP triggers can be placed. Log in to testnet.binancefuture.com, open a trade panel, accept the agreement, then re-place the order.';
+      // These codes appear when:
+      //  (a) the symbol is a TradFi-Perp (XAUUSDT, TSLAUSDT, NVDAUSDT, …) and
+      //      the account hasn't signed the TradFi-Perps agreement, OR
+      //  (b) the entry order didn't actually fill yet, so closePosition=true
+      //      has nothing to close against (race on the demo environment).
+      return `${raw}. If you're trading a TradFi-Perp symbol (XAU/TSLA/NVDA/etc.) you must accept that agreement on the Binance demo/live UI first. For crypto perps (BTCUSDT, ETHUSDT…), this is usually a timing race — retry once.${suffix}`;
     }
-    if (code === -2019) return 'Insufficient margin for the SL/TP reserve. Fund your futures wallet or reduce size.';
-    if (code === -2027) return 'Position would exceed max notional. Reduce size or leverage.';
-    return err?.message || 'Trigger order failed.';
+    if (code === -2019) return `Insufficient margin for the SL/TP reserve. Fund your futures wallet or reduce size.${suffix}`;
+    if (code === -2027) return `Position would exceed max notional. Reduce size or leverage.${suffix}`;
+    if (code === -2010) return `${raw} — the trigger price may be on the wrong side of the mark, or the position no longer exists.${suffix}`;
+    if (code === -1102 || code === -1106) return `Bad parameter on SL/TP trigger: ${raw}.${suffix}`;
+    if (code === -2014 || code === -2015) return `Binance rejected the API key on the trigger order: ${raw}. Verify the key has Futures trading permission and that you're using a key generated on the SAME environment (demo-fapi.binance.com keys do NOT work on testnet.binancefuture.com or production).${suffix}`;
+    return `${raw}${suffix}`;
   }
 
   async cancelOrder(ctx, { symbol, orderLinkId, orderId }) {

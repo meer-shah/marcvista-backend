@@ -113,6 +113,32 @@ const showusdtbalance = async (req, res) => {
   }
 };
 
+// ─── Get per-symbol fee rate ─────────────────────────────────────────────────
+const getFeeRates = async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || '').trim();
+    if (!symbol) return res.status(400).json({ error: 'symbol query param required' });
+    const rates = await orderService.getFeeRates(req.user._id, symbol);
+    res.status(200).json({ symbol, rates });
+  } catch (error) {
+    logger.error('Error in getFeeRates', { message: error?.message });
+    res.status(200).json({ rates: null });
+  }
+};
+
+// ─── Get current leverage ─────────────────────────────────────────────────────
+const getLeverage = async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || '').trim();
+    if (!symbol) return res.status(400).json({ error: 'symbol query param required' });
+    const leverage = await orderService.getLeverage(req.user._id, symbol);
+    res.status(200).json({ symbol, leverage });
+  } catch (error) {
+    logger.error('Error in getLeverage', { message: error?.message });
+    res.status(200).json({ leverage: null });
+  }
+};
+
 // ─── Set leverage ─────────────────────────────────────────────────────────────
 
 const setLeverage = async (req, res) => {
@@ -251,6 +277,8 @@ module.exports = {
   cancelOrder,
   ammendOrder,
   setLeverage,
+  getLeverage,
+  getFeeRates,
   switchMarginMode,
   showusdtbalance,
   getAccountBalanceFromHere,

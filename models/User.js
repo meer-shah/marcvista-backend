@@ -1,6 +1,18 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
+// Goals are user-global (not scoped to risk profile or exchange). Switching
+// risk profiles or exchanges leaves the goal list intact.
+const goalSchema = new mongoose.Schema({
+  goalType: {
+    type: String,
+    enum: ['Daily', 'Weekly', 'Monthly', 'Quarterly', 'Yearly'],
+    required: true,
+  },
+  goalAmount: { type: Number, required: true },
+  createdAt: { type: Date, default: Date.now },
+}, { _id: true });
+
 const userSchema = new mongoose.Schema({
   email: {
     type: String,
@@ -49,6 +61,10 @@ const userSchema = new mongoose.Schema({
     of: { type: mongoose.Schema.Types.ObjectId, ref: 'RiskProfile' },
     default: () => new Map(),
   },
+  // User-global goal list. Replaces the per-RiskProfile sub-array so the
+  // user's goals persist across profile switches.
+  goals: { type: [goalSchema], default: [] },
+
   // JWT token tracking for logout
   tokens: [{
     token: String,

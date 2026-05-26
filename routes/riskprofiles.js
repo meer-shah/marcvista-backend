@@ -7,6 +7,7 @@ const {
   updateRiskProfile,
   activateprofile,
   getActiveRiskProfile,
+  getActiveRiskState,
   resetdeault,
   resetRiskState,
 } = require('../controllers/riskprofilecontroller');
@@ -26,6 +27,8 @@ const router = express.Router();
 router.use(authMiddleware);
 
 router.get('/getactive', getActiveRiskProfile);
+// Active profile + per-exchange runtime state (currentrisk/streak/isFirstTrade)
+router.get('/active-state', getActiveRiskState);
 // Get all risk profiles
 router.get('/', getAllRiskProfiles);
 

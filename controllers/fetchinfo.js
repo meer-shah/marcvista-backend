@@ -755,7 +755,17 @@ const getClosedPnlf = async (req, res) => {
           // the tradeId. If we used Bybit's orderId here, the placement path
           // would not see it as already-processed and would double-tick.
           const exchangeForTick = activeExchange;
-          for (const trade of unprocessedTrades) {
+
+          // Tick chronologically so streak math is deterministic regardless of
+          // how the exchange returns the fills. Without this, a non-stable
+          // sort from getClosedPnl could compound win/loss in different
+          // orders across reloads — same problem the dedup change was meant
+          // to kill, surfacing through a different door.
+          const sortedTrades = [...unprocessedTrades].sort((a, b) =>
+            (Number(a.updatedTime) || 0) - (Number(b.updatedTime) || 0)
+          );
+
+          for (const trade of sortedTrades) {
             const pnl = parseFloat(trade.closedPnl);
             if (isNaN(pnl)) continue;
             const closedPnlId = String(trade.orderId || trade.execId || `${trade.symbol}-${trade.updatedTime}`);
@@ -768,7 +778,13 @@ const getClosedPnlf = async (req, res) => {
             const matched = await Trade.findOne({
               user: req.user._id,
               bybitClosedPnlId: closedPnlId,
-            }).select('_id').lean();
+            }).select('_id riskApplied').lean();
+
+            // Trade already counted toward risk — skip silently. This is the
+            // durable per-Trade dedup; lastProcessedTradeId only remembers ONE
+            // id and couldn't prevent multi-trade re-tick on reload.
+            if (matched?.riskApplied) continue;
+
             const tradeId = matched?._id
               ? String(matched._id)
               : (trade.orderId || trade.execId || trade.closedAt || trade.updatedAt);
@@ -778,9 +794,6 @@ const getClosedPnlf = async (req, res) => {
             await riskProfileService.processNewTradeResultForExchange(
               req.user._id, exchangeForTick, result, String(tradeId)
             );
-            // Mirror to legacy fields (no-op if already up-to-date thanks to
-            // processNewTradeResultForExchange's internal mirror).
-            await riskProfileService.processNewTradeResult(req.user._id, result, String(tradeId));
           }
         } catch (syncError) {
           logger.error('Background risk sync error:', syncError);

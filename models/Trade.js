@@ -50,6 +50,12 @@ const tradeSchema = new Schema({
   notes: { type: String, default: null },
   metadata: { type: Schema.Types.Mixed, default: null },
 
+  // True once this trade's Win/Loss has been folded into the per-exchange
+  // RiskProfileState. The streak-tick path checks this BEFORE applying — so
+  // re-running the closed-PnL sync (e.g. on every page reload) cannot
+  // double-count the same trade, regardless of iteration order.
+  riskApplied: { type: Boolean, default: false, index: true },
+
   orderLinkId: { type: String, index: true },
   bybitOrderId: { type: String, default: null },
   bybitClosedPnlId: { type: String, default: null },

@@ -1,22 +1,6 @@
 const mongoose = require('mongoose');
 const Schema = mongoose.Schema;
 
-const goalSchema = new Schema({
-  goalType: {
-    type: String,
-    enum: ['Daily', 'Weekly', 'Monthly', 'Quarterly', 'Yearly'],
-    required: true,
-  },
-  goalAmount: {
-    type: Number,
-    required: true,
-  },
-  createdAt: {
-    type: Date,
-    default: Date.now, // ✅ use "createdAt" instead of "setAt"
-  }
-}, { _id: true }); // allow goal to be individually deletable via goal._id
-
 const riskProfileSchema = new Schema({
   title: { type: String, required: true },
   description: { type: String },
@@ -38,11 +22,6 @@ const riskProfileSchema = new Schema({
   payoutPercentage: { type: Number },
   noofactivetrades: { type: Number },
   minRiskRewardRatio: { type: Number },
-
-  goals: {
-    type: [goalSchema],
-    default: [],
-  },
 
   createdAt: {
     type: Date,

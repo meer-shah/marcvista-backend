@@ -105,6 +105,18 @@ class IBroker {
   /** @returns {FeeRates} USDT linear-perp Maker/Taker rates at VIP-0 */
   static feeRates() { throw new Error('Not implemented: static feeRates'); }
 
+  /**
+   * Per-symbol fee rate for THIS user — accounts for VIP tier, symbol class
+   * discounts (Bybit XAUUSDT is ~0.028% taker vs ~0.055% for crypto perps),
+   * and account-level promotions. Falls back to static feeRates() if the
+   * broker hasn't implemented it.
+   * @param {string} symbol canonical
+   * @returns {Promise<FeeRates|null>}
+   */
+  async getFeeRatesForSymbol(ctx, symbol) {
+    return this.constructor.feeRates ? this.constructor.feeRates() : null;
+  }
+
   /** @param {'BTCUSDT'} canonical @returns {string} exchange-native */
   static toExchangeSymbol(canonical) { throw new Error('Not implemented'); }
 
@@ -146,6 +158,15 @@ class IBroker {
 
   /** @returns {Promise<OrderResult>} */
   async setLeverage(ctx, { symbol, buyLeverage, sellLeverage }) { throw new Error('Not implemented: setLeverage'); }
+
+  /**
+   * Read the user's CURRENT leverage setting for a symbol — independent of
+   * whether a position is open. Returns null if the exchange doesn't expose
+   * this info or the broker hasn't implemented it.
+   * @param {string} symbol canonical
+   * @returns {Promise<number|null>}
+   */
+  async getLeverage(ctx, symbol) { return null; }
 
   /** @returns {Promise<OrderResult>} */
   async switchMarginMode(ctx, req) { throw new Error('Not implemented: switchMarginMode'); }

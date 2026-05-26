@@ -217,7 +217,6 @@ class RiskProfileService {
       profile.isFirstTrade = true;
       profile.lastProcessedTradeId = null;
       profile.activatedAt = new Date();
-      profile.goals = [];
       await profile.save();
 
       // PER-EXCHANGE active-profile pointer. Record that THIS profile is now
@@ -270,7 +269,6 @@ class RiskProfileService {
           defaultProfile.isFirstTrade = true;
           defaultProfile.lastProcessedTradeId = null;
           defaultProfile.activatedAt = new Date();
-          defaultProfile.goals = [];
           await defaultProfile.save();
           return { message: 'Risk profile deactivated; default profile auto-activated', data: defaultProfile };
         }
@@ -285,7 +283,6 @@ class RiskProfileService {
           anyProfile.isFirstTrade = true;
           anyProfile.lastProcessedTradeId = null;
           anyProfile.activatedAt = new Date();
-          anyProfile.goals = [];
           await anyProfile.save();
           return { message: 'Profile deactivated; another profile auto-activated', data: anyProfile };
         }
@@ -458,12 +455,37 @@ class RiskProfileService {
   }
 
   /**
+   * Return the user's active risk profile MERGED with its per-exchange state.
+   * This is the single source of truth the trading panel should read for
+   * `currentrisk` / `previousrisk` / `isFirstTrade` / streak counters.
+   *
+   * Why: the legacy `RiskProfile` doc holds only one set of mutable counters,
+   * shared across all exchanges. The trading panel needs per-exchange numbers,
+   * otherwise switching exchanges shows whichever exchange ticked last.
+   */
+  async getActiveStateForExchange(userId, exchange) {
+    const { profile, state } = await this.getOrCreateState(userId, exchange);
+    if (!profile || !state) return null;
+    const merged = profile.toObject ? profile.toObject() : { ...profile };
+    merged.currentrisk = state.currentrisk;
+    merged.previousrisk = state.previousrisk;
+    merged.consecutiveWins = state.consecutiveWins;
+    merged.consecutiveLosses = state.consecutiveLosses;
+    merged.isFirstTrade = state.isFirstTrade;
+    merged.lastProcessedTradeId = state.lastProcessedTradeId;
+    merged.activatedAt = state.activatedAt;
+    merged.exchange = exchange;
+    return merged;
+  }
+
+  /**
    * Reset the per-exchange runtime state for a user — wipes streak counters
    * back to initial. Useful when historical drift from mis-classified trades
    * has corrupted the streak.
    */
   async resetState(userId, exchange) {
     const RiskProfileState = require('../models/RiskProfileState');
+    const Trade = require('../models/Trade');
     const { state, profile } = await this.getOrCreateState(userId, exchange);
     if (!state || !profile) return null;
     state.currentrisk = profile.initialRiskPerTrade || 0;
@@ -474,6 +496,18 @@ class RiskProfileService {
     state.lastProcessedTradeId = null;
     state.activatedAt = new Date();
     await state.save();
+
+    // Clear riskApplied on this exchange's trades so the next sync re-ticks
+    // them from scratch. Without this, any closed trade after the reset
+    // moment would compound from initialRiskPerTrade but past trades whose
+    // result we want to fold back in (e.g. after recovering from a botched
+    // backfill) would stay frozen.
+    try {
+      await Trade.updateMany(
+        { user: userId, exchange, outcome: { $in: ['Win', 'Loss'] } },
+        { $set: { riskApplied: false } }
+      );
+    } catch { /* non-fatal */ }
     return state;
   }
 
@@ -487,6 +521,17 @@ class RiskProfileService {
     const { profile, state } = await this.getOrCreateState(userId, exchange);
     if (!profile || !state) return false;
     if (state.lastProcessedTradeId === tradeId) return false;
+
+    // Durable dedup: if `tradeId` is a real Trade._id, check the riskApplied
+    // flag. This survives across reloads and is order-independent — fixes the
+    // oscillation where the sync re-ticked every "unprocessed" trade on each
+    // page load because lastProcessedTradeId only remembers the LAST one.
+    let tradeDoc = null;
+    if (mongoose.Types.ObjectId.isValid(tradeId)) {
+      const Trade = require('../models/Trade');
+      tradeDoc = await Trade.findById(tradeId).select('riskApplied').lean();
+      if (tradeDoc?.riskApplied) return false;
+    }
 
     const reset = Number(profile.reset) || 0;
     let nextWins = Number(state.consecutiveWins) || 0;
@@ -527,17 +572,14 @@ class RiskProfileService {
     state.isFirstTrade = false;
     await state.save();
 
-    // Mirror to LEGACY RiskProfile fields so anything still reading them
-    // (the frontend's calculateAdjustedRisk reads `currentrisk` + `isFirstTrade`
-    // off the RiskProfile doc returned by getActive) sees the same number.
-    // This converges both stores on every tick — no more drift.
-    profile.previousrisk = profile.currentrisk;
-    profile.currentrisk = newRisk;
-    profile.consecutiveWins = nextWins;
-    profile.consecutiveLosses = nextLosses;
-    profile.lastProcessedTradeId = tradeId;
-    profile.isFirstTrade = false;
-    await profile.save();
+    // Stamp the source Trade as applied so it can't be re-ticked on the next
+    // sync pass (page reload, periodic poll, etc.).
+    if (tradeDoc) {
+      try {
+        const Trade = require('../models/Trade');
+        await Trade.updateOne({ _id: tradeId }, { $set: { riskApplied: true } });
+      } catch { /* non-fatal */ }
+    }
     return true;
   }
 }

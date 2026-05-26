@@ -45,6 +45,8 @@ router.post('/ammend-order', orderMutationLimiter, validateBody(amendOrderSchema
 // Position Management Routes
 router.get('/active-positions', fetchinfoController.getPositionInfof); // Get active positions
 router.post('/set-leverage', orderMutationLimiter, validateBody(setLeverageSchema), orderController.setLeverage); // Set leverage for trading
+router.get('/leverage', orderController.getLeverage); // Read current per-symbol leverage
+router.get('/fee-rate', orderController.getFeeRates); // Read user's per-symbol fee rate (maker/taker)
 router.post('/switch-margin-mode', orderMutationLimiter, validateBody(switchMarginModeSchema), orderController.switchMarginMode); // Switch margin mode
 
 // Trade History and Risk Management Routes
