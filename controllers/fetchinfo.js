@@ -823,14 +823,33 @@ const getPortfolioSummary = async (req, res) => {
     const PortfolioService = require('../services/portfolioService');
     const portfolioService = new PortfolioService();
 
-    // Live data from Bybit
-    const [balanceRes, positionsRes] = await Promise.all([
-      http_request("/v5/account/wallet-balance", "GET", "accountType=UNIFIED", "Get Balance for Portfolio", req.user._id),
-      http_request("/v5/position/list", "GET", "category=linear&settleCoin=USDT", "Get Positions for Portfolio", req.user._id),
-    ]);
-
-    const usdtBalance = getUsdtBalance(balanceRes);
-    const positions = positionsRes?.result?.list || [];
+    // Live data from the user's ACTIVE exchange (was hardcoded to Bybit).
+    // Tolerate brokers that error — fall back to historical-only summary.
+    let usdtBalance = 0;
+    let positions = [];
+    const ab = await getActiveBrokerForUser(req);
+    if (ab) {
+      try {
+        const [bal, posList] = await Promise.all([
+          ab.broker.getUsdtBalance(ab.ctx),
+          ab.broker.getPositions(ab.ctx),
+        ]);
+        usdtBalance = bal;
+        // Broker returns canonical Position shape; map to the loose shape
+        // legacy callers expect (side: 'Buy'|'Sell', unrealisedPnl, positionValue).
+        positions = (posList || []).map(p => ({
+          symbol: p.symbol, size: p.size,
+          positionValue: p.positionValue, avgEntryPrice: p.avgEntryPrice,
+          marketPrice: p.marketPrice, unrealisedPnl: p.unrealisedPnL,
+          takeProfit: p.takeProfit, stopLoss: p.stopLoss,
+          side: p.side,
+        }));
+      } catch (brokerErr) {
+        logger.warn('Portfolio summary: broker fetch failed, continuing with historical only', {
+          exchange: ab.exchange, message: brokerErr?.message,
+        });
+      }
+    }
 
     const totalUnrealizedPnl = positions.reduce(
       (sum, p) => sum + parseFloat(p.unrealisedPnl || p.unrealizedPnl || 0), 0
