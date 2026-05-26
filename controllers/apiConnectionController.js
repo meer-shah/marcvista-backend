@@ -326,6 +326,33 @@ exports.setActiveExchange = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/connection/balances — aggregate USDT balance across every
+ * exchange the user has credentials for. Used by the portfolio page to
+ * show cumulative balance + per-exchange breakdown when filter='all'.
+ */
+exports.getAllBalances = async (req, res) => {
+  try {
+    const connections = await listConnectedExchanges(req.user._id);
+    const results = await Promise.allSettled(
+      connections.map(async ({ exchange, mode }) => {
+        const broker = getBroker(exchange);
+        const balance = await broker.getUsdtBalance({ userId: String(req.user._id), mode });
+        return { exchange, mode, balance, ok: true };
+      })
+    );
+    const balances = results.map((r, i) => {
+      if (r.status === 'fulfilled') return r.value;
+      return { exchange: connections[i].exchange, mode: connections[i].mode, balance: 0, ok: false, error: r.reason?.message };
+    });
+    const total = balances.reduce((s, b) => s + (b.ok ? b.balance : 0), 0);
+    res.json({ total, balances });
+  } catch (err) {
+    logger.error('Error in getAllBalances', err);
+    res.status(500).json({ message: 'Failed to fetch balances.' });
+  }
+};
+
 /** GET /api/connection/active-exchange — quick fetch for header / chart prefix. */
 exports.getActiveExchange = async (req, res) => {
   try {

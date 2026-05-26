@@ -31,6 +31,7 @@ router.delete('/api-connection', credentialLimiter, apiConnectionController.dele
 // Static metadata + per-user connection state.
 router.get('/exchanges', apiConnectionController.listSupportedExchanges);
 router.get('/connections', apiConnectionController.getConnectionStatus);
+router.get('/balances', apiConnectionController.getAllBalances);
 
 // Active-exchange selector.
 router.get('/active-exchange', apiConnectionController.getActiveExchange);
