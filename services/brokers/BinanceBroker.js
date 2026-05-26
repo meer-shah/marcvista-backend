@@ -330,8 +330,18 @@ class BinanceBroker extends IBroker {
 
   async listSymbols(ctx) {
     const r = await this._publicGet(ctx.mode, '/fapi/v1/exchangeInfo', {}, 'List Symbols');
+    // Include BOTH crypto perpetuals AND Binance's TradFi-Perp listings
+    // (XAUUSDT, XAGUSDT, TSLAUSDT, NVDAUSDT, etc.). Binance spells the
+    // latter "TRADIFI_PERPETUAL" — note the typo, that's their actual value.
+    // Excludes dated futures (CURRENT_QUARTER / NEXT_QUARTER) which we
+    // don't trade.
+    const acceptedTypes = new Set(['PERPETUAL', 'TRADIFI_PERPETUAL']);
     return (r?.symbols || [])
-      .filter(s => s.status === 'TRADING' && s.quoteAsset === 'USDT' && s.contractType === 'PERPETUAL')
+      .filter(s =>
+        s.status === 'TRADING' &&
+        s.quoteAsset === 'USDT' &&
+        acceptedTypes.has(s.contractType)
+      )
       .map(s => s.symbol);
   }
 }
