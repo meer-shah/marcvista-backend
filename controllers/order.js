@@ -39,9 +39,16 @@ const placeOrder = async (req, res) => {
             if (!['Win', 'Loss', null].includes(data.lastTradeResult)) {
                 return res.status(400).json({ error: 'lastTradeResult must be Win, Loss, or null' });
             }
-            await orderService.placeOrderWithRiskProfile(req.user._id, data, riskProfile);
+            const result = await orderService.placeOrderWithRiskProfile(req.user._id, data, riskProfile);
             writeAuditLog({ event: 'order.placed', userId: req.user._id, metadata: { symbol: data.symbol, side: data.side, type: 'risk_profile' }, req });
-            return res.status(200).json({ message: "Order placed with risk profile" });
+            // If the broker attached SL/TP triggers and any of them failed
+            // (e.g. Binance TradFi agreement not signed), surface the warning
+            // so the UI can show a toast — the entry IS live but unprotected.
+            const warning = result?._triggerWarning;
+            return res.status(200).json({
+              message: "Order placed with risk profile",
+              ...(warning ? { warning } : {}),
+            });
         }
     } catch (error) {
         logger.error('Error in placeOrder', {

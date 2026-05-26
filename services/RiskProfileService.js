@@ -176,26 +176,11 @@ class RiskProfileService {
       profile.goals = [];
       await profile.save();
 
-      // Reset the per-exchange runtime state too — otherwise it carries the
-      // drifted counters from the previous activation and OrderService sizes
-      // orders against stale numbers.
-      try {
-        const RiskProfileState = require('../models/RiskProfileState');
-        await RiskProfileState.updateMany(
-          { user: userId, riskProfile: profile._id },
-          {
-            $set: {
-              currentrisk: profile.initialRiskPerTrade,
-              previousrisk: 0,
-              consecutiveWins: 0,
-              consecutiveLosses: 0,
-              isFirstTrade: true,
-              lastProcessedTradeId: null,
-              activatedAt: new Date(),
-            },
-          }
-        );
-      } catch { /* state collection may not exist on first boot — non-fatal */ }
+      // NOTE: we deliberately do NOT wipe RiskProfileState rows here. Per
+      // the multi-exchange design, each (profile, exchange) state is
+      // preserved independently — toggling a profile on/off must not lose
+      // streak progress on other exchanges. To reset, use the explicit
+      // resetState(userId, exchange) endpoint instead.
 
       return { message: 'Risk profile activated successfully', data: profile };
     } else {

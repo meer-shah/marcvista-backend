@@ -106,37 +106,42 @@ class BinanceBroker extends IBroker {
       _raw: entry,
     };
 
-    // 2 & 3) attach SL and TP as reduce-only triggers if provided
+    // 2 & 3) Attach SL and TP as separate reduce-only triggers.
+    //   Binance USDT-M doesn't store SL/TP inline on the entry — they're
+    //   separate STOP_MARKET / TAKE_PROFIT_MARKET orders with closePosition.
     const closeSide = req.side === 'Buy' ? 'SELL' : 'BUY';
-    if (req.stopLoss != null) {
+    const attachTrigger = async (label, type, price) => {
       try {
-        await this._signedRequest(ctx, 'POST', '/fapi/v1/order', 'Create SL Trigger', {
+        await this._signedRequest(ctx, 'POST', '/fapi/v1/order', label, {
           symbol: req.symbol,
           side: closeSide,
-          type: 'STOP_MARKET',
-          stopPrice: String(req.stopLoss),
+          type,
+          stopPrice: String(price),
           closePosition: 'true',
           workingType: 'MARK_PRICE',
+          priceProtect: 'true',
         });
       } catch (err) {
-        logger.warn('[Binance] SL trigger failed', { message: err.message });
+        const msg = this._explainTriggerError(err);
+        logger.warn(`[Binance] ${label} failed`, { message: msg, code: err.binanceCode });
+        // Bubble up the actionable message — controller surfaces it to the
+        // toast so the user knows they need to fix something on Binance.
+        result._triggerWarning = (result._triggerWarning ? result._triggerWarning + ' | ' : '') + `${label}: ${msg}`;
       }
-    }
-    if (req.takeProfit != null) {
-      try {
-        await this._signedRequest(ctx, 'POST', '/fapi/v1/order', 'Create TP Trigger', {
-          symbol: req.symbol,
-          side: closeSide,
-          type: 'TAKE_PROFIT_MARKET',
-          stopPrice: String(req.takeProfit),
-          closePosition: 'true',
-          workingType: 'MARK_PRICE',
-        });
-      } catch (err) {
-        logger.warn('[Binance] TP trigger failed', { message: err.message });
-      }
-    }
+    };
+    if (req.stopLoss != null) await attachTrigger('Create SL Trigger', 'STOP_MARKET', req.stopLoss);
+    if (req.takeProfit != null) await attachTrigger('Create TP Trigger', 'TAKE_PROFIT_MARKET', req.takeProfit);
     return result;
+  }
+
+  _explainTriggerError(err) {
+    const code = err?.binanceCode;
+    if (code === -4120 || code === -4411) {
+      return 'Binance testnet requires you to accept the TradFi-Perps agreement before SL/TP triggers can be placed. Log in to testnet.binancefuture.com, open a trade panel, accept the agreement, then re-place the order.';
+    }
+    if (code === -2019) return 'Insufficient margin for the SL/TP reserve. Fund your futures wallet or reduce size.';
+    if (code === -2027) return 'Position would exceed max notional. Reduce size or leverage.';
+    return err?.message || 'Trigger order failed.';
   }
 
   async cancelOrder(ctx, { symbol, orderLinkId, orderId }) {
@@ -145,6 +150,29 @@ class BinanceBroker extends IBroker {
     else if (orderLinkId) params.origClientOrderId = orderLinkId;
     else throw new Error('cancelOrder requires orderId or orderLinkId');
     const r = await this._signedRequest(ctx, 'DELETE', '/fapi/v1/order', 'Cancel Order', params);
+    // Also cancel any orphan SL/TP triggers on this symbol that no longer
+    // have an entry / position to close against. Cheap belt-and-braces:
+    // fetch open orders for this symbol, drop any STOP_MARKET / TP_MARKET.
+    try {
+      const open = await this._signedRequest(ctx, 'GET', '/fapi/v1/openOrders', 'Get Open Orders (cleanup)', { symbol });
+      const triggers = (open || []).filter(o =>
+        o.type === 'STOP_MARKET' || o.type === 'TAKE_PROFIT_MARKET'
+      );
+      // Only drop triggers if no entry is left for this symbol — otherwise we'd
+      // strip protection from a still-active leg.
+      const stillHasEntry = (open || []).some(o =>
+        o.type !== 'STOP_MARKET' && o.type !== 'TAKE_PROFIT_MARKET'
+      );
+      if (!stillHasEntry) {
+        for (const t of triggers) {
+          try {
+            await this._signedRequest(ctx, 'DELETE', '/fapi/v1/order', 'Cancel Orphan Trigger', { symbol, orderId: t.orderId });
+          } catch (err) {
+            logger.warn('[Binance] Orphan trigger cancel failed', { orderId: t.orderId, message: err.message });
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
     return { retCode: 0, retMsg: 'OK', _raw: r };
   }
 
@@ -211,24 +239,40 @@ class BinanceBroker extends IBroker {
 
   async getPendingOrders(ctx) {
     const r = await this._signedRequest(ctx, 'GET', '/fapi/v1/openOrders', 'Get Pending Orders');
-    return (r || [])
+    const all = r || [];
+    // Index SL/TP trigger orders by (symbol, opposite-side) so we can attach
+    // their stopPrice onto the matching entry order's row. Binance keeps
+    // these as separate orders; the UI wants them shown as inline SL/TP.
+    const triggers = { stop: new Map(), tp: new Map() }; // key = "symbol|side"
+    for (const o of all) {
+      if (o.type === 'STOP_MARKET') {
+        triggers.stop.set(`${o.symbol}|${o.side}`, o.stopPrice);
+      } else if (o.type === 'TAKE_PROFIT_MARKET') {
+        triggers.tp.set(`${o.symbol}|${o.side}`, o.stopPrice);
+      }
+    }
+    return all
       .filter(o => !['STOP_MARKET', 'TAKE_PROFIT_MARKET', 'TRAILING_STOP_MARKET'].includes(o.type))
-      .map(o => ({
-        _id: String(o.orderId),
-        symbol: o.symbol,
-        qty: o.origQty,
-        quantity: o.origQty,
-        price: o.price,
-        side: o.side === 'BUY' ? 'Buy' : 'Sell',
-        type: o.type,
-        status: o.status,
-        stopLoss: '',
-        takeProfit: '',
-        createdAt: o.time,
-        createdTime: String(o.time),
-        orderLinkId: o.clientOrderId,
-        _raw: o,
-      }));
+      .map(o => {
+        const closeSide = o.side === 'BUY' ? 'SELL' : 'BUY';
+        const key = `${o.symbol}|${closeSide}`;
+        return {
+          _id: String(o.orderId),
+          symbol: o.symbol,
+          qty: o.origQty,
+          quantity: o.origQty,
+          price: o.price,
+          side: o.side === 'BUY' ? 'Buy' : 'Sell',
+          type: o.type,
+          status: o.status,
+          stopLoss: triggers.stop.get(key) || '',
+          takeProfit: triggers.tp.get(key) || '',
+          createdAt: o.time,
+          createdTime: String(o.time),
+          orderLinkId: o.clientOrderId,
+          _raw: o,
+        };
+      });
   }
 
   async getClosedPnl(ctx) {
