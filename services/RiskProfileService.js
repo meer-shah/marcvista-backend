@@ -83,6 +83,22 @@ class RiskProfileService {
   }
 
   /**
+   * Return the list of exchange ids on which this profile is currently the
+   * active selection (per User.activeRiskProfileByExchange). Used to block
+   * edits/deletes of any profile in use on any exchange.
+   */
+  async _exchangesActiveOn(userId, profileId) {
+    const User = require('../models/User');
+    const user = await User.findById(userId).select('activeRiskProfileByExchange').lean();
+    const map = user?.activeRiskProfileByExchange || {};
+    const out = [];
+    for (const [ex, pid] of Object.entries(map)) {
+      if (pid && String(pid) === String(profileId)) out.push(ex);
+    }
+    return out;
+  }
+
+  /**
    * Delete a risk profile (owned by user).
    */
   async delete(userId, profileId) {
@@ -95,9 +111,17 @@ class RiskProfileService {
       return { error: 'Risk profile not found', status: 404 };
     }
 
-    // Cannot delete an active profile — deactivate it first
+    // Cannot delete a profile active on ANY exchange — check both the legacy
+    // `ison` flag (current exchange) AND the per-exchange map (all exchanges).
     if (riskProfile.ison) {
       return { error: 'Cannot delete an active risk profile. Deactivate it first.', status: 400 };
+    }
+    const activeOn = await this._exchangesActiveOn(userId, profileId);
+    if (activeOn.length > 0) {
+      return {
+        error: `Cannot delete — this profile is active on ${activeOn.join(', ')}. Switch to that exchange and activate a different profile first.`,
+        status: 400,
+      };
     }
 
     // If the profile being deleted is the default, auto-promote another profile
@@ -115,10 +139,30 @@ class RiskProfileService {
 
   /**
    * Update a risk profile (owned by user).
+   * Blocks edits to a profile active on ANY exchange — its rules are being
+   * used to size live trades, so changing them mid-stream would break the
+   * streak math. User must switch to a different profile on each exchange
+   * where this one is active before editing.
    */
   async update(userId, profileId, updates) {
     if (!mongoose.Types.ObjectId.isValid(profileId)) {
       return { error: 'Invalid ID format', status: 400 };
+    }
+
+    // Pre-check active state before mutating.
+    const target = await RiskProfile.findOne({ _id: profileId, user: userId }).select('ison').lean();
+    if (!target) {
+      return { error: 'Risk profile not found', status: 404 };
+    }
+    if (target.ison) {
+      return { error: 'Cannot edit an active risk profile. Switch to another profile first.', status: 400 };
+    }
+    const activeOn = await this._exchangesActiveOn(userId, profileId);
+    if (activeOn.length > 0) {
+      return {
+        error: `Cannot edit — this profile is active on ${activeOn.join(', ')}. Switch to a different profile on those exchanges first.`,
+        status: 400,
+      };
     }
 
     const updatedRiskProfile = await RiskProfile.findOneAndUpdate(
@@ -360,12 +404,34 @@ class RiskProfileService {
   // ──────────────────────────────────────────────────────────────────────────
 
   /**
-   * Fetch (or lazily create) the RiskProfileState for (user, active profile, exchange).
-   * Returns null if the user has no active risk profile.
+   * Fetch (or lazily create) the RiskProfileState for the profile active on
+   * (user, exchange). Resolves the profile via User.activeRiskProfileByExchange
+   * — NOT via RiskProfile.ison, which only reflects the user's CURRENT
+   * exchange and would return the wrong profile when called for another
+   * exchange's sync. Falls back to whichever profile is globally ison=true
+   * if no map entry exists yet (first call on a fresh exchange).
    */
   async getOrCreateState(userId, exchange) {
     const RiskProfileState = require('../models/RiskProfileState');
-    const profile = await RiskProfile.findOne({ user: userId, ison: true });
+    const User = require('../models/User');
+    const user = await User.findById(userId).select('activeRiskProfileByExchange').lean();
+    let profile = null;
+    const mappedId = user?.activeRiskProfileByExchange?.[exchange];
+    if (mappedId) {
+      profile = await RiskProfile.findOne({ _id: mappedId, user: userId });
+    }
+    if (!profile) {
+      // Fallback — no map entry yet → use globally-active profile and remember it.
+      profile = await RiskProfile.findOne({ user: userId, ison: true });
+      if (profile) {
+        try {
+          await User.updateOne(
+            { _id: userId },
+            { $set: { [`activeRiskProfileByExchange.${exchange}`]: profile._id } }
+          );
+        } catch { /* non-fatal */ }
+      }
+    }
     if (!profile) return { profile: null, state: null };
 
     let state = await RiskProfileState.findOne({
