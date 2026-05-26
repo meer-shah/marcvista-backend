@@ -20,7 +20,7 @@
 const mongoose = require('mongoose');
 const logger = require('../utils/logger');
 
-const MIGRATION_ID = '2026-05-26-multi-exchange-foundations';
+const MIGRATION_ID = '2026-05-26-multi-exchange-foundations-v2';
 
 async function alreadyApplied(db) {
   const doc = await db.collection('migrations').findOne({ _id: MIGRATION_ID });
@@ -103,6 +103,23 @@ async function migrate() {
       updatedAt: new Date(),
     });
     touched.riskProfileStates++;
+  }
+
+  // 5) Drop the legacy unique index on apiconnections.user — replaced by a
+  // compound (user, exchange) unique. The Mongoose schema no longer declares
+  // unique-on-user, but Mongo retains the old index until explicitly dropped.
+  // Without this, inserting a SECOND exchange row for the same user fails.
+  try {
+    const indexes = await db.collection('apiconnections').indexes();
+    for (const idx of indexes) {
+      const keys = Object.keys(idx.key || {});
+      if (idx.unique && keys.length === 1 && keys[0] === 'user') {
+        await db.collection('apiconnections').dropIndex(idx.name);
+        logger.info('Dropped legacy unique index on apiconnections.user', { name: idx.name });
+      }
+    }
+  } catch (err) {
+    logger.warn('Could not drop legacy apiconnections unique index', { message: err?.message });
   }
 
   await markApplied(db);

@@ -9,19 +9,58 @@
  */
 const crypto = require('crypto');
 const RiskProfile = require('../models/riskprofilemodal');
+const User = require('../models/User');
 const Trade = require('../models/Trade');
 const { getUsdtBalance } = require('../controllers/calculations');
-const { classifyFillType, computeFeeAwareQty, effectiveRR, MAKER_FEE, TAKER_FEE } = require('../utils/feeMath');
+const { classifyFillType, computeFeeAwareQty, effectiveRR, feeRatesFor, TAKER_FEE } = require('../utils/feeMath');
+const { getBroker, getBrokerContext } = require('./brokers');
 const logger = require('../utils/logger');
 
-// Default broker — BybitBroker singleton used by the controller.
-// Tests can inject a different broker via the constructor.
-const BybitBroker = require('./BybitBroker');
-const defaultBroker = new BybitBroker();
+// Legacy default broker sentinel — distinguishes "no broker injected, use
+// factory" from "test passed in a mock broker, use that".
+const LegacyBybitBroker = require('./BybitBroker');
+const DEFAULT_BROKER = new LegacyBybitBroker();
 
 class OrderService {
-  constructor(broker = defaultBroker) {
+  /**
+   * @param {object} [broker] — optional override (mainly for unit tests).
+   *   When provided, every method uses this broker instead of the factory.
+   */
+  constructor(broker = DEFAULT_BROKER) {
     this.broker = broker;
+    this._brokerInjected = broker !== DEFAULT_BROKER;
+  }
+
+  /**
+   * Resolve which exchange to act on for this user.
+   * Tolerant of bad user IDs / missing user docs — falls back to 'bybit'.
+   */
+  async _resolveExchange(userId, explicit) {
+    if (explicit) return explicit;
+    try {
+      const user = await User.findById(userId).select('activeExchange').lean();
+      return user?.activeExchange || 'bybit';
+    } catch {
+      return 'bybit';
+    }
+  }
+
+  /**
+   * Return { broker, ctx, exchange }.
+   * If a mock broker was injected via the constructor, returns that with a
+   * legacy-shaped ctx (userId only). Otherwise looks up the user's active
+   * exchange and returns the corresponding broker from the factory.
+   */
+  async _getBroker(userId, exchange) {
+    const ex = await this._resolveExchange(userId, exchange);
+    if (this._brokerInjected) {
+      // Test mode — caller injected a mock broker. Skip the credential
+      // lookup (which would require a real DB) and synthesize a ctx.
+      return { broker: this.broker, ctx: { userId, mode: 'demo' }, exchange: ex, legacy: true };
+    }
+    const broker = getBroker(ex);
+    const ctx = await getBrokerContext(userId, ex);
+    return { broker, ctx, exchange: ex, legacy: false };
   }
 
   // ─── Internal helpers ────────────────────────────────────────────────────────
@@ -36,22 +75,28 @@ class OrderService {
   /**
    * Place a simple order on the exchange (no risk profile logic).
    */
-  async simplePlaceOrder(userId, data) {
+  async simplePlaceOrder(userId, data, exchange = null) {
     try {
       const orderLinkId = data.orderLinkId || crypto.randomBytes(16).toString('hex');
-
       const formatEnum = (str) => str ? str.charAt(0).toUpperCase() + str.slice(1).toLowerCase() : undefined;
+      const { broker, ctx } = await this._getBroker(userId, exchange);
 
-      const formattedData = {
-        ...data,
-        orderLinkId,
+      const request = {
+        symbol: data.symbol,
         side: formatEnum(data.side),
+        category: data.category || 'linear',
+        qty: String(data.qty),
         orderType: formatEnum(data.orderType),
+        price: data.price,
+        stopLoss: data.stopLoss,
+        takeProfit: data.takeProfit,
+        timeInForce: data.timeInForce || 'GTC',
+        orderLinkId,
       };
-      
-      const result = await this.broker.placeOrder(userId, formattedData);
+
+      const result = await broker.placeOrder(ctx, request);
       if (result.retCode !== 0) {
-        throw new Error(`Bybit API error: ${result.retMsg} (retCode: ${result.retCode})`);
+        throw new Error(`Exchange API error: ${result.retMsg} (retCode: ${result.retCode})`);
       }
       return result;
     } catch (error) {
@@ -64,13 +109,22 @@ class OrderService {
    * Place an order with active risk profile calculations applied.
    * Validates R:R, calculates position size from USDT balance, updates risk state.
    */
-  async placeOrderWithRiskProfile(userId, data, riskProfile = null) {
+  async placeOrderWithRiskProfile(userId, data, riskProfile = null, exchange = null) {
     try {
+      // 0. Resolve exchange + broker + per-exchange runtime state
+      const { broker, ctx, exchange: ex } = await this._getBroker(userId, exchange);
+      const RiskProfileService = require('./RiskProfileService');
+      const riskProfileService = new RiskProfileService();
+
       // 1. Use passed-in risk profile if available (avoids duplicate DB read from controller)
       if (!riskProfile) {
         riskProfile = await RiskProfile.findOne({ user: userId, ison: true });
       }
       if (!riskProfile) this._throwError('No active risk profile found.');
+
+      // 1b. Get the per-exchange runtime state (currentrisk / streak / isFirstTrade).
+      const { state } = await riskProfileService.getOrCreateState(userId, ex);
+      if (!state) this._throwError('Could not initialize risk profile state for exchange.');
 
       // 2. Validate adjustedRisk and lastTradeResult
       if (typeof data.adjustedRisk !== 'number' || isNaN(data.adjustedRisk)) {
@@ -93,47 +147,39 @@ class OrderService {
         this._throwError(`Risk-to-reward ratio ${riskRewardRatio.toFixed(2)} is less than minimum required ${minRiskRewardRatio}`);
       }
 
-      // 4 & 5. Fetch USDT balance and ticker precision in parallel (independent calls)
-      const [accountBalanceResponse, tickerInfo] = await Promise.all([
-        this.broker.getBalance(userId, 'accountType=UNIFIED'),
-        this.broker.getTicker(data.symbol),
+      // 4 & 5. Fetch USDT balance + ticker + qty step via the broker (exchange-agnostic).
+      const [usdtBalance, tickerInfo, instrument] = await Promise.all([
+        broker.getUsdtBalance(ctx),
+        broker.getTicker(ctx, data.symbol),
+        broker.getInstrumentInfo(ctx, data.symbol),
       ]);
-      const usdtBalance = getUsdtBalance(accountBalanceResponse);
       if (usdtBalance <= 0) this._throwError('Insufficient USDT balance.');
       if (!tickerInfo) this._throwError(`Ticker information not found for symbol ${data.symbol}`);
-      const bid1Size = parseFloat(tickerInfo.bid1Size);
-      if (isNaN(bid1Size)) this._throwError(`Invalid bid1Size for symbol ${data.symbol}: ${bid1Size}`);
-      const precision = (bid1Size.toString().split('.')[1] || '').length;
+      if (!instrument) this._throwError(`Instrument info not found for symbol ${data.symbol}`);
 
-      // 6. Update risk profile state using centralized service logic
-      // This handles streak tracking, reset logic, and double-counting prevention (via lastTradeId)
-      const RiskProfileService = require('./RiskProfileService');
-      const riskProfileService = new RiskProfileService();
-      
-      if (data.lastTradeResult && data.lastTradeId && !riskProfile.isFirstTrade) {
-        logger.info('Processing last trade result before placement', { lastTradeResult: data.lastTradeResult, lastTradeId: data.lastTradeId });
-        await riskProfileService.processNewTradeResult(userId, data.lastTradeResult, data.lastTradeId);
-        
-        // Re-fetch the risk profile to get updated values for position sizing
-        const updatedProfile = await RiskProfile.findOne({ user: userId, ison: true });
-        if (updatedProfile) {
-          logger.info('Risk profile updated after results processing', { 
-            currentRisk: updatedProfile.currentrisk, 
-            losses: updatedProfile.consecutiveLosses,
-            isFirstTrade: updatedProfile.isFirstTrade
-          });
-          riskProfile = updatedProfile;
-          // Important: We use the UPDATED risk profile values for the quantity calculation
-          data.adjustedRisk = riskProfile.currentrisk;
+      // Derive qty precision from the exchange's qtyStep (e.g. "0.001" → 3).
+      const qtyStepStr = String(instrument.qtyStep || '1');
+      const precision = (qtyStepStr.split('.')[1] || '').length;
+
+      // 6. Update PER-EXCHANGE risk profile state for the user's last trade result.
+      if (data.lastTradeResult && data.lastTradeId && !state.isFirstTrade) {
+        logger.info('Processing last trade result before placement', { lastTradeResult: data.lastTradeResult, lastTradeId: data.lastTradeId, exchange: ex });
+        await riskProfileService.processNewTradeResultForExchange(userId, ex, data.lastTradeResult, data.lastTradeId);
+        const refreshed = await riskProfileService.getOrCreateState(userId, ex);
+        if (refreshed?.state) {
+          state.currentrisk = refreshed.state.currentrisk;
+          state.consecutiveLosses = refreshed.state.consecutiveLosses;
+          state.consecutiveWins = refreshed.state.consecutiveWins;
+          state.isFirstTrade = refreshed.state.isFirstTrade;
+          data.adjustedRisk = refreshed.state.currentrisk;
         }
       }
 
-      // Mark first trade as consumed — subsequent orders will use compounding logic
-      if (riskProfile.isFirstTrade) {
-        riskProfile.isFirstTrade = false;
-        await riskProfile.save();
-        // Use the initial risk for position sizing on first trade
-        data.adjustedRisk = riskProfile.currentrisk;
+      // Mark first trade as consumed on this exchange — subsequent orders compound.
+      if (state.isFirstTrade) {
+        state.isFirstTrade = false;
+        await state.save();
+        data.adjustedRisk = state.currentrisk || riskProfile.initialRiskPerTrade;
       }
 
       // 7. Calculate FEE-INCLUSIVE position size.
@@ -153,8 +199,9 @@ class OrderService {
         ? data.side.charAt(0).toUpperCase() + data.side.slice(1).toLowerCase()
         : 'Buy';
       const feeMode = classifyFillType(normalizedSide, orderPrice, livePrice);
-      const feeEntry = feeMode === 'maker' ? MAKER_FEE : TAKER_FEE;
-      const feeExit = TAKER_FEE; // TP/SL exits trigger as market
+      const exchangeFees = feeRatesFor(ex);
+      const feeEntry = feeMode === 'maker' ? exchangeFees.maker : exchangeFees.taker;
+      const feeExit = exchangeFees.taker; // TP/SL exits trigger as market
 
       const qtyRaw = computeFeeAwareQty({
         riskUsd: riskAmount,
@@ -186,24 +233,25 @@ class OrderService {
       const qtyNum = parseFloat(newQty);
       const feeReserveUsd = qtyNum * orderPrice * feeEntry + qtyNum * stopLossPrice * feeExit;
 
-      // 8. Prepare clean order data for Bybit
+      // 8. Build an exchange-agnostic OrderRequest (broker translates to native).
       const formatEnum = (str) => str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
-
       const orderLinkId = crypto.randomBytes(16).toString('hex');
-      const bybitOrder = {
+      const request = {
         symbol: data.symbol,
         side: data.side ? formatEnum(data.side) : undefined,
-        category: data.category,
+        category: data.category || 'linear',
         qty: newQty.toString(),
-        orderType: data.orderType ? formatEnum(data.orderType) : undefined,
-        price: data.price.toString(),
-        stopLoss: data.stopLoss.toString(),
-        takeProfit: data.takeProfit.toString(),
+        orderType: data.orderType ? formatEnum(data.orderType) : 'Limit',
+        price: data.price,
+        stopLoss: data.stopLoss,
+        takeProfit: data.takeProfit,
         timeInForce: 'GTC',
-        positionIdx: 0,
         orderLinkId,
       };
-      const result = await this.simplePlaceOrder(userId, bybitOrder);
+      const result = await broker.placeOrder(ctx, request);
+      if (result.retCode !== 0) {
+        throw new Error(`Exchange API error: ${result.retMsg} (retCode: ${result.retCode})`);
+      }
 
       // 9. Persist Trade record SYNCHRONOUSLY — must complete before we return,
       // otherwise a race or silent error leaves no Pending row in our DB and
@@ -220,6 +268,7 @@ class OrderService {
           riskProfile: riskProfile._id,
           activatedAt: riskProfile.activatedAt || riskProfile.createdAt,
           tradeNumber,
+          exchange: ex,
           symbol: data.symbol,
           side: formatEnum(data.side),
           category: data.category || 'linear',
@@ -267,25 +316,22 @@ class OrderService {
    * Exception: if this was the very first order (no wins/losses yet), reset isFirstTrade = true
    * so the user gets fresh-start behaviour on their next order attempt.
    */
-  async cancelOrder(userId, symbol, orderLinkId) {
-    const data = {
-      category: 'linear',
-      symbol,
-      orderLinkId,
-    };
-
-    const response = await this.broker.cancelOrder(userId, data);
+  async cancelOrder(userId, symbol, orderLinkId, exchange = null) {
+    const { broker, ctx, exchange: ex } = await this._getBroker(userId, exchange);
+    const response = await broker.cancelOrder(ctx, { symbol, orderLinkId });
 
     if (response.retCode !== 0) {
-      throw new Error(`Bybit cancel error: ${response.retMsg} (retCode: ${response.retCode})`);
+      throw new Error(`Exchange cancel error: ${response.retMsg} (retCode: ${response.retCode})`);
     }
 
-    // If no trades have been executed yet (first order was placed but not filled),
-    // reset isFirstTrade so the next order placement still uses the initial risk.
-    const riskProfile = await RiskProfile.findOne({ user: userId, ison: true });
-    if (riskProfile && riskProfile.consecutiveWins === 0 && riskProfile.consecutiveLosses === 0) {
-      riskProfile.isFirstTrade = true;
-      await riskProfile.save();
+    // If no trades have been executed yet ON THIS EXCHANGE (first order was placed
+    // but not filled), reset isFirstTrade so the next order placement uses initial risk.
+    const RiskProfileService = require('./RiskProfileService');
+    const riskProfileService = new RiskProfileService();
+    const { state } = await riskProfileService.getOrCreateState(userId, ex);
+    if (state && state.consecutiveWins === 0 && state.consecutiveLosses === 0) {
+      state.isFirstTrade = true;
+      await state.save();
     }
 
     setImmediate(async () => {
@@ -303,53 +349,52 @@ class OrderService {
   }
 
   /**
-   * Amend an existing open order.
+   * Amend an existing open order on the user's active exchange.
    */
-  async amendOrder(userId, data) {
-    return this.broker.amendOrder(userId, data);
+  async amendOrder(userId, data, exchange = null) {
+    const { broker, ctx } = await this._getBroker(userId, exchange);
+    return broker.amendOrder(ctx, data);
   }
 
   /**
-   * Set leverage for a symbol.
+   * Set leverage for a symbol on the user's active exchange.
    */
-  async setLeverage(userId, symbol, buyLeverage, sellLeverage) {
-    const response = await this.broker.setLeverage(userId, {
-      category: 'linear',
+  async setLeverage(userId, symbol, buyLeverage, sellLeverage, exchange = null) {
+    const { broker, ctx } = await this._getBroker(userId, exchange);
+    const response = await broker.setLeverage(ctx, {
       symbol,
-      buyLeverage: buyLeverage.toString(),
-      sellLeverage: sellLeverage.toString(),
+      buyLeverage,
+      sellLeverage,
     });
 
     // 110043 = "leverage not modified" — requested leverage already in effect.
-    // Treat as success so the UI doesn't surface a misleading error.
     if (response.retCode === 110043) {
       return { ...response, retCode: 0, retMsg: 'Leverage already set' };
     }
-
     if (response.retCode !== 0) {
-      logger.error('Bybit setLeverage error', { symbol, buyLeverage, sellLeverage, response });
-      const err = new Error(`Bybit API error: ${response.retMsg} (retCode: ${response.retCode})`);
+      logger.error('Exchange setLeverage error', { symbol, buyLeverage, sellLeverage, response });
+      const err = new Error(`Exchange API error: ${response.retMsg} (retCode: ${response.retCode})`);
       err.bybitRetCode = response.retCode;
       err.bybitRetMsg = response.retMsg;
       throw err;
     }
-
     return response;
   }
 
   /**
-   * Switch margin mode.
+   * Switch margin mode on the user's active exchange.
    */
-  async switchMarginMode(userId, data) {
-    return this.broker.switchMarginMode(userId, data);
+  async switchMarginMode(userId, data, exchange = null) {
+    const { broker, ctx } = await this._getBroker(userId, exchange);
+    return broker.switchMarginMode(ctx, data);
   }
 
   /**
-   * Get USDT balance.
+   * Get USDT balance from the user's active exchange.
    */
-  async getUsdtBalance(userId) {
-    const response = await this.broker.getBalance(userId, 'accountType=UNIFIED');
-    return getUsdtBalance(response);
+  async getUsdtBalance(userId, exchange = null) {
+    const { broker, ctx } = await this._getBroker(userId, exchange);
+    return broker.getUsdtBalance(ctx);
   }
 }
 
