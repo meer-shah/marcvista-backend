@@ -762,28 +762,41 @@ const getClosedPnlf = async (req, res) => {
           //   - merged-only fills (the original close already ticked the streak)
           //   - external fills (trades placed directly on Bybit, not via the app)
           // Risk math = single source of truth from APP trades only.
+          //
+          // CRITICAL: the dedup key (lastProcessedTradeId) MUST be the same
+          // identifier the FRONTEND will send when placing the next order.
+          // Frontend reads `lastTradeId = trade._id` from the Trade document.
+          // The sync therefore looks up the matching Trade._id and uses it as
+          // the tradeId. If we used Bybit's orderId here, the placement path
+          // would not see it as already-processed and would double-tick.
+          const User = require('../models/User');
+          const userDoc = await User.findById(req.user._id).select('activeExchange').lean();
+          const exchangeForTick = userDoc?.activeExchange || 'bybit';
           for (const trade of unprocessedTrades) {
             const pnl = parseFloat(trade.closedPnl);
             if (isNaN(pnl)) continue;
             const closedPnlId = String(trade.orderId || trade.execId || `${trade.symbol}-${trade.updatedTime}`);
             if (mergedOnlyFillIds.has(closedPnlId)) continue;
             if (externalFillIds.has(closedPnlId)) continue;
-            const result = pnl > 0 ? 'Win' : 'Loss';
-            const tradeId = trade.orderId || trade.execId || trade.closedAt || trade.updatedAt;
+
+            // Look up the Trade row this close was matched to so we can use
+            // its _id as the canonical dedup key. Match by bybitClosedPnlId
+            // (set by the matching cascade earlier in this same sync pass).
+            const matched = await Trade.findOne({
+              user: req.user._id,
+              bybitClosedPnlId: closedPnlId,
+            }).select('_id').lean();
+            const tradeId = matched?._id
+              ? String(matched._id)
+              : (trade.orderId || trade.execId || trade.closedAt || trade.updatedAt);
             if (!tradeId) continue;
-            // Tick PER-EXCHANGE state (RiskProfileState) — this is what
-            // OrderService.placeOrderWithRiskProfile reads when sizing the
-            // next order. The legacy single-exchange RiskProfile.* fields
-            // are mirrored in parallel for back-compat with anything still
-            // reading them.
-            const User = require('../models/User');
-            const userDoc = await User.findById(req.user._id).select('activeExchange').lean();
-            const exchangeForTick = userDoc?.activeExchange || 'bybit';
+
+            const result = pnl > 0 ? 'Win' : 'Loss';
             await riskProfileService.processNewTradeResultForExchange(
               req.user._id, exchangeForTick, result, String(tradeId)
             );
-            // Mirror to legacy fields so any code still reading
-            // RiskProfile.currentrisk sees the same number.
+            // Mirror to legacy fields (no-op if already up-to-date thanks to
+            // processNewTradeResultForExchange's internal mirror).
             await riskProfileService.processNewTradeResult(req.user._id, result, String(tradeId));
           }
         } catch (syncError) {
