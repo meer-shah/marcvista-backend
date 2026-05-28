@@ -80,8 +80,14 @@ class GoalService {
     );
     let allTrades = [];
     try {
+      // Only count APP-placed trades toward goal progress. External trades
+      // (opened directly on the exchange UI, not through Marcvista) aren't
+      // governed by the risk profile rules the goal is set against, so
+      // crediting them would inflate the bar with PnL the user's strategy
+      // didn't actually drive.
       allTrades = await Trade.find({
         user: userId,
+        source: 'app',
         outcome: { $in: ['Win', 'Loss'] },
         closedAt: { $gte: new Date(earliestGoalStart) },
       }).select('pnl closedAt').lean();
