@@ -205,7 +205,7 @@ class RiskProfileService {
       return { error: 'Invalid ID format', status: 400 };
     }
 
-    const target = await RiskProfile.findOne({ _id: profileId, user: userId }).select('_id').lean();
+    const target = await RiskProfile.findOne({ _id: profileId, user: userId }).lean();
     if (!target) {
       return { error: 'Risk profile not found', status: 404 };
     }
@@ -230,6 +230,25 @@ class RiskProfileService {
     for (const k of ALLOWED_UPDATE_FIELDS) {
       if (updates[k] !== undefined) safeUpdates[k] = updates[k];
     }
+
+    // Risk-bounds invariant — partial updates must be validated against the
+    // RESULTING merged state, not just the body. minRisk above initial (or
+    // initial above max) makes processNewTradeResultForExchange's clamp
+    // misbehave on every tick. Reject at the API boundary.
+    const merged = { ...target, ...safeUpdates };
+    const min = Number(merged.minRisk);
+    const init = Number(merged.initialRiskPerTrade);
+    const max = Number(merged.maxRisk);
+    if (Number.isFinite(min) && Number.isFinite(init) && min > init) {
+      return { error: `Invalid risk bounds: minRisk (${min}) cannot exceed initialRiskPerTrade (${init}).`, status: 400 };
+    }
+    if (Number.isFinite(init) && Number.isFinite(max) && init > max) {
+      return { error: `Invalid risk bounds: initialRiskPerTrade (${init}) cannot exceed maxRisk (${max}).`, status: 400 };
+    }
+    if (Number.isFinite(min) && Number.isFinite(max) && min > max) {
+      return { error: `Invalid risk bounds: minRisk (${min}) cannot exceed maxRisk (${max}).`, status: 400 };
+    }
+
     const updatedRiskProfile = await RiskProfile.findOneAndUpdate(
       { _id: profileId, user: userId },
       safeUpdates,

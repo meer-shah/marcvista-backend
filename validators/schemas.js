@@ -27,6 +27,28 @@ const loginSchema = z.object({
 // Accept number or empty string/undefined (controller sanitizes to defaults).
 const numOrEmpty = z.union([z.number(), z.literal(''), z.undefined()]);
 
+// Risk-bound invariant — minRisk <= initialRiskPerTrade <= maxRisk. If this
+// were violated, the per-tick clamp in processNewTradeResultForExchange
+// (Math.max(minRisk, Math.min(newRisk, maxRisk))) would produce nonsensical
+// state — e.g. setting minRisk=5 above initial=3 lets a loss tick compound
+// to 1.5, then ratchet back up to 5 on the next read, then drop to 0.75 on
+// the next loss, etc. Reject the config at the API boundary instead.
+const numericOrUndefined = (v) =>
+  v === '' || v === undefined ? undefined : Number(v);
+const riskBoundsRefine = (data) => {
+  const min = numericOrUndefined(data.minRisk);
+  const init = numericOrUndefined(data.initialRiskPerTrade);
+  const max = numericOrUndefined(data.maxRisk);
+  if (min != null && init != null && min > init) return false;
+  if (init != null && max != null && init > max) return false;
+  if (min != null && max != null && min > max) return false;
+  return true;
+};
+const riskBoundsMessage = {
+  message: 'Invalid risk bounds — required: minRisk ≤ initialRiskPerTrade ≤ maxRisk.',
+  path: ['initialRiskPerTrade'],
+};
+
 const riskProfileCreateSchema = z.object({
   title: z.string().trim().min(1).max(120),
   description: z.string().trim().max(500).optional().default(''),
@@ -41,7 +63,7 @@ const riskProfileCreateSchema = z.object({
   payoutPercentage: numOrEmpty.optional(),
   minRiskRewardRatio: numOrEmpty.optional(),
   isDefault: z.boolean().optional(),
-}).passthrough();
+}).passthrough().refine(riskBoundsRefine, riskBoundsMessage);
 
 // Update allows partial — same fields, all optional.
 // IMPORTANT: this schema is .strip() (the zod default) — unknown keys are
