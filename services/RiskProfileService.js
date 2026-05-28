@@ -46,11 +46,15 @@ class RiskProfileService {
     if (!mongoose.Types.ObjectId.isValid(profileId)) {
       return { error: 'Invalid ID format', status: 400 };
     }
-    const riskProfile = await RiskProfile.findOne({ _id: profileId, user: userId });
+    const riskProfile = await RiskProfile.findOne({ _id: profileId, user: userId }).lean();
     if (!riskProfile) {
       return { error: 'Risk profile not found', status: 404 };
     }
-    return { data: riskProfile };
+    // Tag with `ison` to match the response shape from getAll — single
+    // profile endpoints used to return raw docs, leaving the frontend to
+    // guess activity from a list lookup.
+    const activeId = await this._activeIdForCurrentExchange(userId);
+    return { data: { ...riskProfile, ison: activeId ? String(riskProfile._id) === activeId : false } };
   }
 
   /**
@@ -125,6 +129,16 @@ class RiskProfileService {
       } catch { /* non-fatal */ }
     }
     return fallback;
+  }
+
+  /**
+   * Resolve the profile id currently active on the user's CURRENT exchange,
+   * or null. Wrapper used by single-profile read paths to tag responses with
+   * `ison` consistently with getAll().
+   */
+  async _activeIdForCurrentExchange(userId) {
+    const p = await this.resolveActiveProfile(userId).catch(() => null);
+    return p ? String(p._id) : null;
   }
 
   /**
@@ -220,11 +234,12 @@ class RiskProfileService {
       { _id: profileId, user: userId },
       safeUpdates,
       { new: true }
-    );
+    ).lean();
     if (!updatedRiskProfile) {
       return { error: 'Risk profile not found', status: 404 };
     }
-    return { data: updatedRiskProfile };
+    const activeId = await this._activeIdForCurrentExchange(userId);
+    return { data: { ...updatedRiskProfile, ison: activeId ? String(updatedRiskProfile._id) === activeId : false } };
   }
 
   /**
@@ -373,73 +388,11 @@ class RiskProfileService {
 
     return { message: 'Default risk profile updated successfully.', data: updatedProfile };
   }
-  /**
-   * Process a new trade result, update streak counters, and apply reset point if needed.
-   * Returns true if the profile was updated.
-   */
-  async processNewTradeResult(userId, tradeResult, tradeId, providedProfile = null, saveProfile = true) {
-    if (!tradeResult || !tradeId) return false;
 
-    const profile = providedProfile || await this.resolveActiveProfile(userId);
-    if (!profile) return false;
-
-    // Prevent double-counting
-    if (profile.lastProcessedTradeId === tradeId) {
-      return false;
-    }
-
-    const reset = Number(profile.reset) || 0;
-    let nextWins = Number(profile.consecutiveWins) || 0;
-    let nextLosses = Number(profile.consecutiveLosses) || 0;
-    let newRisk = Number(profile.currentrisk) || Number(profile.initialRiskPerTrade) || 0;
-
-    if (tradeResult === 'Win') {
-      nextWins++;
-      nextLosses = 0;
-      // Compound win
-      newRisk = newRisk * (1 + (Number(profile.increaseOnWin) || 0) / 100);
-    } else if (tradeResult === 'Loss') {
-      nextLosses++;
-      nextWins = 0;
-      // Compound loss
-      newRisk = newRisk * (1 - (Number(profile.decreaseOnLoss) || 0) / 100);
-    }
-
-    // Apply Reset Logic (Deterministic)
-    if (reset > 0 && (nextWins >= reset || nextLosses >= reset)) {
-      newRisk = Number(profile.initialRiskPerTrade);
-      nextWins = 0;
-      nextLosses = 0;
-    }
-
-    // Clamp risk
-    const minRisk = Number(profile.minRisk) || 0;
-    const maxRisk = Number(profile.maxRisk) || 100;
-    newRisk = Math.max(minRisk, Math.min(newRisk, maxRisk));
-
-    // Update profile
-    logger.info('Risk profile updating', { 
-      tradeId, 
-      result: tradeResult, 
-      oldRisk: profile.currentrisk, 
-      newRisk, 
-      oldLosses: profile.consecutiveLosses, 
-      nextLosses,
-      resetPoint: reset,
-      didReset: (reset > 0 && nextLosses === 0 && newRisk === profile.initialRiskPerTrade && tradeResult === 'Loss')
-    });
-
-    profile.previousrisk = profile.currentrisk;
-    profile.currentrisk = newRisk;
-    profile.consecutiveWins = nextWins;
-    profile.consecutiveLosses = nextLosses;
-    profile.lastProcessedTradeId = tradeId;
-
-    if (saveProfile) {
-      await profile.save();
-    }
-    return true;
-  }
+  // Legacy `processNewTradeResult` (global-flag streak tick) was removed —
+  // all live call sites now use processNewTradeResultForExchange, which
+  // mutates per-exchange state in RiskProfileState. See git history if you
+  // need to recover the old single-store implementation.
 
   // ──────────────────────────────────────────────────────────────────────────
   // Per-exchange runtime state — Phase 3 of multi-exchange.

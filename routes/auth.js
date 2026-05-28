@@ -51,7 +51,7 @@ router.post('/register', authLimiter, validateBody(registerSchema), async (req, 
     await user.save();
 
     // Provision a default starter risk profile for the new user
-    await RiskProfile.create({
+    const starterProfile = await RiskProfile.create({
       user: user._id,
       title: 'Starter Profile',
       description: 'Default risk profile created on account setup.',
@@ -68,10 +68,18 @@ router.post('/register', authLimiter, validateBody(registerSchema), async (req, 
       noofactivetrades: 3,
       default: true,
     });
-    // Active profile per exchange is resolved on demand from
-    // User.activeRiskProfileByExchange (the only source of truth) — falling
-    // back to whichever profile is marked `default` for the user. No global
-    // ison flag to seed.
+    // Pre-seed the per-exchange active-profile map for the user's default
+    // exchange so the trading panel resolves a profile immediately without
+    // a lazy first-trade write through resolveActiveProfile's fallback.
+    try {
+      const defaultExchange = user.activeExchange || 'bybit';
+      await User.updateOne(
+        { _id: user._id },
+        { $set: { [`activeRiskProfileByExchange.${defaultExchange}`]: starterProfile._id } }
+      );
+    } catch (e) {
+      logger.warn('Failed to pre-seed activeRiskProfileByExchange on signup', { message: e?.message });
+    }
 
     // Generate token
     const token = await user.generateAuthToken();

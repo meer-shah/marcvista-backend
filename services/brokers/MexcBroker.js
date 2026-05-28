@@ -180,12 +180,23 @@ class MexcBroker extends IBroker {
     if (longOk && shortOk) {
       return { retCode: 0, retMsg: 'OK', _raw: results.map(r => r.value || r.reason) };
     }
-    // Surface whichever side failed with the actual MEXC message so the
-    // toast tells the user something useful instead of "OK".
+    // Partial-failure path: one side applied, the other didn't. Tell the
+    // user precisely which side failed AND that the OTHER side already
+    // mutated, so they understand the account is in a split-leverage state
+    // (and a retry would re-apply the successful side as a no-op + retry
+    // the failed side — safe).
+    const sideLabel = (i) => (i === 0 ? 'Long' : 'Short');
     const failure = results.find(r => !ok(r));
-    const msg = failure?.value?.message || failure?.value?.msg ||
-                failure?.reason?.message || 'MEXC leverage change rejected';
-    return { retCode: -1, retMsg: msg, _raw: results.map(r => r.value || r.reason) };
+    const failureIdx = results.indexOf(failure);
+    const successSide = sideLabel(1 - failureIdx);
+    const failureSide = sideLabel(failureIdx);
+    const rawMsg = failure?.value?.message || failure?.value?.msg ||
+                   failure?.reason?.message || 'MEXC leverage change rejected';
+    const partial = longOk || shortOk;
+    const retMsg = partial
+      ? `${failureSide} leverage failed (${rawMsg}). ${successSide} leverage already updated — your account is now split-leverage. Retry to align both sides.`
+      : `MEXC leverage change rejected: ${rawMsg}`;
+    return { retCode: -1, retMsg, _raw: results.map(r => r.value || r.reason) };
   }
 
   /**
