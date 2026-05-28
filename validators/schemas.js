@@ -44,6 +44,12 @@ const riskProfileCreateSchema = z.object({
 }).passthrough();
 
 // Update allows partial — same fields, all optional.
+// IMPORTANT: this schema is .strip() (the zod default) — unknown keys are
+// dropped silently rather than passed through. Mutable runtime state
+// (currentrisk, previousrisk, consecutiveWins, consecutiveLosses,
+// isFirstTrade, lastProcessedTradeId, activatedAt) lives on RiskProfileState
+// per-exchange and MUST NOT be writable via the profile PATCH endpoint.
+// `ison` is also excluded — activation goes through PUT /:id/activate.
 const riskProfileUpdateSchema = z.object({
   title: z.string().trim().min(1).max(120).optional(),
   description: z.string().trim().max(500).optional(),
@@ -58,13 +64,8 @@ const riskProfileUpdateSchema = z.object({
   payoutPercentage: z.number().optional(),
   minRiskRewardRatio: z.number().optional(),
   noofactivetrades: z.number().optional(),
-  ison: z.boolean().optional(),
   default: z.boolean().optional(),
-  previousrisk: z.number().optional(),
-  currentrisk: z.number().optional(),
-  consecutiveWins: z.number().optional(),
-  consecutiveLosses: z.number().optional(),
-}).passthrough();
+});
 
 const riskProfileActivateSchema = z.object({
   ison: z.boolean(),

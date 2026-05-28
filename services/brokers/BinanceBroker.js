@@ -80,9 +80,14 @@ class BinanceBroker extends IBroker {
     }
   }
 
-  async _publicGet(mode, path, params = {}, info) {
+  async _publicGet(_mode, path, params = {}, info) {
+    // ALWAYS route public market data (tickers, exchangeInfo, klines) to
+    // production fapi.binance.com — `demo-fapi.binance.com` only serves the
+    // authenticated demo endpoints and 401s on unsigned market reads, which
+    // would silently break the symbol selector and chart on demo mode.
+    // Public market data is identical between prod and demo anyway.
     const qs = new URLSearchParams(params).toString();
-    const url = this._baseUrl(mode) + path + (qs ? `?${qs}` : '');
+    const url = REAL_BASE + path + (qs ? `?${qs}` : '');
     try {
       const res = await axios.get(url, { timeout: HTTP_TIMEOUT });
       return res.data;

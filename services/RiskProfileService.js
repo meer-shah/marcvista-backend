@@ -203,9 +203,22 @@ class RiskProfileService {
       };
     }
 
+    // Project to allowed keys only — defense in depth even if the validator
+    // ever gets relaxed. Per-exchange runtime state lives in RiskProfileState
+    // and must NEVER be reachable via this PATCH path.
+    const ALLOWED_UPDATE_FIELDS = [
+      'title', 'description', 'SLallowedperday', 'initialRiskPerTrade',
+      'increaseOnWin', 'decreaseOnLoss', 'maxRisk', 'minRisk', 'reset',
+      'growthThreshold', 'payoutPercentage', 'minRiskRewardRatio',
+      'noofactivetrades', 'default',
+    ];
+    const safeUpdates = {};
+    for (const k of ALLOWED_UPDATE_FIELDS) {
+      if (updates[k] !== undefined) safeUpdates[k] = updates[k];
+    }
     const updatedRiskProfile = await RiskProfile.findOneAndUpdate(
       { _id: profileId, user: userId },
-      updates,
+      safeUpdates,
       { new: true }
     );
     if (!updatedRiskProfile) {
@@ -251,8 +264,17 @@ class RiskProfileService {
         },
         { upsert: true, new: true }
       );
+      // Stamp only trades that BELONG TO THIS PROFILE on this exchange. If
+      // we marked all exchange trades, a later reactivation of a DIFFERENT
+      // profile on the same exchange would inherit those stamps and never
+      // re-tick its own historical trades onto its own fresh state.
       await Trade.updateMany(
-        { user: userId, exchange, outcome: { $in: ['Win', 'Loss'] } },
+        {
+          user: userId,
+          exchange,
+          riskProfile: profile._id,
+          outcome: { $in: ['Win', 'Loss'] },
+        },
         { $set: { riskApplied: true } }
       );
     } catch (err) {
