@@ -18,26 +18,47 @@ const MAX_GOALS_PER_USER = 1;
 async function _loadUserWithBackfill(userId) {
   const user = await User.findById(userId).select('goals');
   if (!user) return null;
-  // One-time backfill: if the user has no global goals yet but a legacy
-  // per-profile goal exists, pull the first one over so they don't lose it.
-  if (!user.goals || user.goals.length === 0) {
-    try {
-      const profileWithGoals = await RiskProfile.findOne({
-        user: userId,
-        goals: { $exists: true, $not: { $size: 0 } },
-      }).select('goals').lean();
-      const legacy = profileWithGoals?.goals?.[0];
-      if (legacy) {
-        user.goals = [{
-          goalType: legacy.goalType,
-          goalAmount: legacy.goalAmount,
-          createdAt: legacy.createdAt || new Date(),
-        }];
-        await user.save();
+  // ONE-TIME backfill from legacy per-profile goals.
+  //
+  // Two failure modes the current logic must avoid:
+  //   (a) If the user has legacy goals but `user.goals` is empty, copy ONE
+  //       legacy goal into `user.goals` so they don't lose it on the
+  //       schema migration.
+  //   (b) After backfill, CLEAR the legacy source — otherwise deleting the
+  //       backfilled goal would just refill it from the same legacy row on
+  //       the next getGoals call (the reason the UI kept showing the goal
+  //       after a successful delete).
+  //
+  // We always sweep legacy `RiskProfile.goals` entries to [] regardless of
+  // whether user.goals is empty. After this method runs once per user, the
+  // legacy source is gone and backfill becomes a no-op forever.
+  try {
+    const profilesWithGoals = await RiskProfile.find({
+      user: userId,
+      goals: { $exists: true, $not: { $size: 0 } },
+    }).select('goals');
+    if (profilesWithGoals.length > 0) {
+      // Only seed user.goals if it's truly empty — don't overwrite goals
+      // the user may have created post-migration.
+      if (!user.goals || user.goals.length === 0) {
+        const legacy = profilesWithGoals[0].goals[0];
+        if (legacy) {
+          user.goals = [{
+            goalType: legacy.goalType,
+            goalAmount: legacy.goalAmount,
+            createdAt: legacy.createdAt || new Date(),
+          }];
+          await user.save();
+        }
       }
-    } catch (err) {
-      logger.warn('Goal backfill from legacy RiskProfile failed', { message: err?.message });
+      // Clear ALL legacy profile-level goals so they can never replay.
+      await RiskProfile.updateMany(
+        { user: userId, goals: { $exists: true, $not: { $size: 0 } } },
+        { $set: { goals: [] } }
+      );
     }
+  } catch (err) {
+    logger.warn('Goal backfill from legacy RiskProfile failed', { message: err?.message });
   }
   return user;
 }
