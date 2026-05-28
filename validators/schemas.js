@@ -97,37 +97,65 @@ const apiConnectionSchema = z.object({
 });
 
 // ---- Orders ----
+// Numeric fields arrive as strings from the exchange-style payload; coerce
+// then defensively bound. Upper bounds are deliberately generous — they
+// exist to reject obvious garbage (negative, NaN, Infinity, absurd values),
+// not to enforce trading limits (those live on RiskProfile + broker).
+const positiveNum = z
+  .union([z.string(), z.number()])
+  .transform((v) => (typeof v === 'string' ? Number(v) : v))
+  .refine((n) => Number.isFinite(n) && n > 0, { message: 'Must be a positive finite number.' })
+  .refine((n) => n <= 1e12, { message: 'Value is unreasonably large.' });
+
+const nonNegativeNum = z
+  .union([z.string(), z.number()])
+  .transform((v) => (typeof v === 'string' ? Number(v) : v))
+  .refine((n) => Number.isFinite(n) && n >= 0, { message: 'Must be a non-negative finite number.' })
+  .refine((n) => n <= 1e12, { message: 'Value is unreasonably large.' });
+
+const leverageNum = z
+  .union([z.string(), z.number()])
+  .transform((v) => (typeof v === 'string' ? Number(v) : v))
+  .refine((n) => Number.isFinite(n) && n >= 1 && n <= 125, { message: 'Leverage must be between 1 and 125.' });
+
 const placeOrderSchema = z.object({
-  symbol: z.string().trim().min(1),
+  symbol: z.string().trim().min(1).max(40),
   side: z.enum(['Buy', 'Sell']),
-  category: z.string().trim().min(1),
-  qty: z.union([z.string(), z.number()]),
-  orderType: z.string().trim().min(1),
-  price: z.union([z.string(), z.number()]),
-  takeProfit: z.union([z.string(), z.number()]),
-  stopLoss: z.union([z.string(), z.number()]),
-  adjustedRisk: z.number().optional(),
+  category: z.string().trim().min(1).max(20),
+  qty: positiveNum,
+  orderType: z.string().trim().min(1).max(20),
+  price: nonNegativeNum,
+  takeProfit: nonNegativeNum,
+  stopLoss: nonNegativeNum,
+  // adjustedRisk is a % of equity per trade. OrderService additionally clamps
+  // it to [profile.minRisk, profile.maxRisk] — here we only reject obvious
+  // garbage (negative, NaN, > 100% of equity).
+  adjustedRisk: z.number().finite().gt(0).lte(100).optional(),
   lastTradeResult: z.enum(['Win', 'Loss']).nullable().optional(),
 }).passthrough();
 
 const cancelOrderSchema = z.object({
-  symbol: z.string().trim().min(1, 'Symbol is required.'),
-  orderLinkId: z.string().optional(),
-  orderId: z.string().optional(),
+  symbol: z.string().trim().min(1, 'Symbol is required.').max(40),
+  orderLinkId: z.string().max(64).optional(),
+  orderId: z.string().max(64).optional(),
 }).passthrough();
 
 const setLeverageSchema = z.object({
-  symbol: z.string().trim().min(1),
-  buyLeverage: z.union([z.string(), z.number()]),
-  sellLeverage: z.union([z.string(), z.number()]),
+  symbol: z.string().trim().min(1).max(40),
+  buyLeverage: leverageNum,
+  sellLeverage: leverageNum,
 });
 
 const amendOrderSchema = z.object({
-  symbol: z.string().trim().min(1),
+  symbol: z.string().trim().min(1).max(40),
+  qty: positiveNum.optional(),
+  price: nonNegativeNum.optional(),
+  takeProfit: nonNegativeNum.optional(),
+  stopLoss: nonNegativeNum.optional(),
 }).passthrough();
 
 const switchMarginModeSchema = z.object({
-  symbol: z.string().trim().min(1),
+  symbol: z.string().trim().min(1).max(40),
 }).passthrough();
 
 const riskProfileIdParamSchema = z.object({

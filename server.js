@@ -20,7 +20,7 @@ const authRoutes = require('./routes/auth');
 const newsRoutes = require('./routes/news');
 
 // Validate required environment variables before starting
-const requiredEnvVars = ['JWT_SECRET', 'ENCRYPTION_KEY', 'MONGO_URI', 'PORT'];
+const requiredEnvVars = ['JWT_SECRET', 'ENCRYPTION_KEY', 'MONGO_URI', 'PORT', 'CSRF_SECRET'];
 const missingVars = requiredEnvVars.filter(v => !process.env[v]);
 
 if (missingVars.length > 0) {
@@ -44,11 +44,49 @@ if (process.env.NODE_ENV === 'production') {
 // Sentry — must be initialised before any other middleware or routes.
 // SENTRY_DSN is optional; if absent, Sentry is a no-op (safe for local dev).
 if (process.env.SENTRY_DSN) {
+  // Scrub secrets from any event before it leaves the process. Sentry's
+  // default serializer captures req.headers (incl. Authorization + Cookie),
+  // and our errors may carry decrypted API credentials in stack frames or
+  // breadcrumbs — none of that should be sent to a third-party service.
+  const REDACTED = '[redacted]';
+  const SENSITIVE_HEADERS = ['authorization', 'cookie', 'set-cookie', 'x-csrf-token'];
+  const SENSITIVE_BODY_KEYS = /^(password|token|apiKey|secretKey|secret|authToken|csrfToken)$/i;
+
+  const scrubObject = (obj) => {
+    if (!obj || typeof obj !== 'object') return obj;
+    for (const k of Object.keys(obj)) {
+      if (SENSITIVE_BODY_KEYS.test(k)) obj[k] = REDACTED;
+    }
+    return obj;
+  };
+
   Sentry.init({
     dsn: process.env.SENTRY_DSN,
     environment: process.env.NODE_ENV || 'development',
     // Capture 100% of transactions in production; reduce if volume is high
     tracesSampleRate: process.env.NODE_ENV === 'production' ? 0.2 : 1.0,
+    beforeSend(event) {
+      try {
+        if (event.request) {
+          if (event.request.headers) {
+            for (const h of SENSITIVE_HEADERS) {
+              if (event.request.headers[h]) event.request.headers[h] = REDACTED;
+            }
+          }
+          if (event.request.cookies) event.request.cookies = REDACTED;
+          scrubObject(event.request.data);
+          scrubObject(event.request.query_string);
+        }
+        if (event.extra) scrubObject(event.extra);
+        if (event.contexts) {
+          for (const ctx of Object.values(event.contexts)) scrubObject(ctx);
+        }
+      } catch {
+        // Never let scrubbing throw — drop the event instead of leaking it.
+        return null;
+      }
+      return event;
+    },
   });
 }
 

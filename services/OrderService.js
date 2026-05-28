@@ -196,6 +196,26 @@ class OrderService {
         data.adjustedRisk = initial;
       }
 
+      // Defensive clamp: regardless of how adjustedRisk arrived (client input,
+      // state.currentrisk, or initialRiskPerTrade), bound it to the profile's
+      // declared [minRisk, maxRisk] before sizing the position. Prevents a
+      // stale state row or a tampered client from ever risking more than the
+      // profile allows. Falls back to a safe 0.1%–10% window if the profile
+      // is missing bounds for any reason.
+      {
+        const lo = Number.isFinite(riskProfile.minRisk) && riskProfile.minRisk > 0
+          ? riskProfile.minRisk : 0.1;
+        const hi = Number.isFinite(riskProfile.maxRisk) && riskProfile.maxRisk > 0
+          ? riskProfile.maxRisk : 10;
+        const clamped = Math.min(hi, Math.max(lo, data.adjustedRisk));
+        if (clamped !== data.adjustedRisk) {
+          logger.warn('adjustedRisk clamped to profile bounds', {
+            original: data.adjustedRisk, clamped, minRisk: lo, maxRisk: hi,
+          });
+          data.adjustedRisk = clamped;
+        }
+      }
+
       // 7. Calculate FEE-INCLUSIVE position size.
       // Total loss at SL (price-move loss + entry fee + SL exit fee) will equal
       // the stated risk amount exactly. Fee mode is predicted from side+entry+live:

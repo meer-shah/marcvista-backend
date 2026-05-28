@@ -15,12 +15,18 @@ const {
 
 const router = express.Router();
 
+// Key on user ID when authenticated so users behind a shared NAT/office IP
+// don't share quota. Falls back to IP for the rare unauthenticated case
+// (these routes are auth-gated below, so it's belt-and-braces).
+const userOrIpKey = (req) => (req.user?._id ? String(req.user._id) : req.ip);
+
 // Placing orders: 30 per 15 min — generous for active trading, blocks spam
 const placeOrderLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: userOrIpKey,
   message: { message: 'Too many order requests. Please wait before placing more orders.' },
 });
 
@@ -30,6 +36,7 @@ const orderMutationLimiter = rateLimit({
   max: 60,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: userOrIpKey,
   message: { message: 'Too many requests. Please slow down.' },
 });
 

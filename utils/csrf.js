@@ -14,9 +14,12 @@
  */
 const crypto = require('crypto');
 
-const CSRF_SECRET = process.env.CSRF_SECRET || process.env.JWT_SECRET;
+// CSRF_SECRET is independent from JWT_SECRET on purpose — coupling them means
+// rotating one silently breaks the other. server.js enforces this at boot
+// via requiredEnvVars, so by the time this module is required the var is set.
+const CSRF_SECRET = process.env.CSRF_SECRET;
 if (!CSRF_SECRET) {
-  throw new Error('CSRF secret missing: set CSRF_SECRET or JWT_SECRET env var');
+  throw new Error('CSRF_SECRET env var is required.');
 }
 
 // 2h TTL balances risk (shorter = better) with usability (too short spams

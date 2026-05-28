@@ -190,12 +190,31 @@ router.get('/me', optionalAuth, async (req, res) => {
 });
 
 // Update profile (name + phone + profilePicture)
+// profilePicture must be a base64 data URL for a common image type and stay
+// under PROFILE_PICTURE_MAX_BYTES — guards against arbitrary string storage
+// (XSS surface if a future component ever renders it as HTML) and oversized
+// payloads slipping past the 3mb body limit.
+const PROFILE_PICTURE_DATA_URL_RE = /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]+$/;
+const PROFILE_PICTURE_MAX_BYTES = 500 * 1024;
+
 router.put('/profile', authMiddleware, async (req, res) => {
   try {
     const { name, phone, profilePicture } = req.body;
     if (name !== undefined) req.user.name = name.trim();
     if (phone !== undefined) req.user.phone = phone ? phone.trim() : '';
-    if (profilePicture !== undefined) req.user.profilePicture = profilePicture;
+    if (profilePicture !== undefined) {
+      if (profilePicture === null || profilePicture === '') {
+        req.user.profilePicture = null;
+      } else if (typeof profilePicture !== 'string'
+          || !PROFILE_PICTURE_DATA_URL_RE.test(profilePicture)
+          || Buffer.byteLength(profilePicture, 'utf8') > PROFILE_PICTURE_MAX_BYTES) {
+        return res.status(400).json({
+          message: 'profilePicture must be a base64 data URL (png/jpg/webp/gif) under 500KB.',
+        });
+      } else {
+        req.user.profilePicture = profilePicture;
+      }
+    }
     await req.user.save();
     res.json({
       message: 'Profile updated successfully.',
