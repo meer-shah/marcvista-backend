@@ -66,9 +66,12 @@ router.post('/register', authLimiter, validateBody(registerSchema), async (req, 
       payoutPercentage: 50,
       minRiskRewardRatio: 1.5,
       noofactivetrades: 3,
-      ison: true,
       default: true,
     });
+    // Active profile per exchange is resolved on demand from
+    // User.activeRiskProfileByExchange (the only source of truth) — falling
+    // back to whichever profile is marked `default` for the user. No global
+    // ison flag to seed.
 
     // Generate token
     const token = await user.generateAuthToken();

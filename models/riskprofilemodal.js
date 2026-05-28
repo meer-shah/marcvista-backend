@@ -27,10 +27,6 @@ const riskProfileSchema = new Schema({
     type: Date,
     default: Date.now,
   },
-  ison: {
-    type: Boolean,
-    default: false,
-  },
   default: {
     type: Boolean,
     default: false,
@@ -51,10 +47,10 @@ const riskProfileSchema = new Schema({
 
 // Indexes for hot query paths:
 //  - all queries filter by user
-//  - getActive: { user, ison: true }
-//  - resetDefault / deleteRiskProfile: { user, default: true }
+//  - resetDefault / deleteRiskProfile / fallback active lookup: { user, default: true }
+// Active-profile-per-exchange is resolved via User.activeRiskProfileByExchange
+// then a primary-key lookup, so no `ison` index is needed.
 riskProfileSchema.index({ user: 1 });
-riskProfileSchema.index({ user: 1, ison: 1 });
 riskProfileSchema.index({ user: 1, default: 1 });
 
 module.exports = mongoose.model('RiskProfile', riskProfileSchema);

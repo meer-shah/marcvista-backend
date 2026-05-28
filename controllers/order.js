@@ -1,4 +1,6 @@
 const RiskProfile = require('../models/riskprofilemodal');
+const RiskProfileService = require('../services/RiskProfileService');
+const _riskProfileService = new RiskProfileService();
 const Trade = require('../models/Trade');
 const OrderService = require('../services/OrderService');
 const TradeQueryService = require('../services/tradeQueryService');
@@ -26,7 +28,7 @@ const placeOrder = async (req, res) => {
         }
 
         // Check risk profile for this user
-        const riskProfile = await RiskProfile.findOne({ user: req.user._id, ison: true });
+        const riskProfile = await _riskProfileService.resolveActiveProfile(req.user._id);
         if (!riskProfile) {
             await orderService.simplePlaceOrder(req.user._id, data);
             writeAuditLog({ event: 'order.placed', userId: req.user._id, metadata: { symbol: data.symbol, side: data.side, type: 'simple' }, req });
@@ -193,7 +195,7 @@ const getAccountBalanceFromHere = async (userId, queryParams) => {
 
 const getRealPerformance = async (req, res) => {
   try {
-    const riskProfile = await RiskProfile.findOne({ user: req.user._id, ison: true });
+    const riskProfile = await _riskProfileService.resolveActiveProfile(req.user._id);
     if (!riskProfile) {
       return res.status(200).json({ summary: null, message: 'No active risk profile' });
     }

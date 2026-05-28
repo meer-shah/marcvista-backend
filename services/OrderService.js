@@ -118,7 +118,7 @@ class OrderService {
 
       // 1. Use passed-in risk profile if available (avoids duplicate DB read from controller)
       if (!riskProfile) {
-        riskProfile = await RiskProfile.findOne({ user: userId, ison: true });
+        riskProfile = await riskProfileService.resolveActiveProfile(userId, ex);
       }
       if (!riskProfile) this._throwError('No active risk profile found.');
 

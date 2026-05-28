@@ -403,7 +403,7 @@ const getClosedPnlf = async (req, res) => {
           const RiskProfile = require('../models/riskprofilemodal');
           const Trade = require('../models/Trade');
 
-          const activeProfile = await RiskProfile.findOne({ user: req.user._id, ison: true });
+          const activeProfile = await riskProfileService.resolveActiveProfile(req.user._id, activeExchange);
           if (!activeProfile) return;
 
           const activatedAt = (activeProfile.activatedAt ? new Date(activeProfile.activatedAt).getTime() : 0) - 5000;

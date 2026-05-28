@@ -15,7 +15,6 @@ jest.mock('../utils/logger', () => ({
 // ── Mock RiskProfile model ──────────────────────────────────────────────────
 const mockRiskProfile = {
   user: 'user123',
-  ison: true,
   minRiskRewardRatio: 1,
   consecutiveWins: 0,
   consecutiveLosses: 0,

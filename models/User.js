@@ -53,9 +53,9 @@ const userSchema = new mongoose.Schema({
     index: true,
   },
   // Per-exchange active risk-profile pointer — keyed by exchange id, value =
-  // the profile ObjectId active on that exchange. Lets each exchange remember
-  // its own profile selection. RiskProfile.ison is kept in sync with this map
-  // for the user's currently-active exchange so legacy code paths still work.
+  // the profile ObjectId active on that exchange. Single source of truth for
+  // "which profile is active where"; replaces the old global RiskProfile.ison
+  // flag (which only ever represented one exchange at a time).
   activeRiskProfileByExchange: {
     type: Map,
     of: { type: mongoose.Schema.Types.ObjectId, ref: 'RiskProfile' },
