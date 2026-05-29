@@ -80,3 +80,28 @@ exports.getTicker = async (req, res) => {
     res.status(502).json({ error: 'Failed to fetch ticker' });
   }
 };
+
+/**
+ * Historical klines proxy for the user's active exchange. Only brokers that
+ * implement getKlines (currently MEXC, whose public REST blocks browser CORS)
+ * return data; others 501 so the frontend falls back to a direct fetch.
+ */
+exports.getKlines = async (req, res) => {
+  try {
+    const symbol = String(req.params.symbol || '').toUpperCase();
+    if (!symbol) return res.status(400).json({ error: 'symbol required' });
+    const interval = String(req.query.interval || '').trim();
+    if (!interval) return res.status(400).json({ error: 'interval required' });
+    const limit = Math.max(1, Math.min(1000, parseInt(req.query.limit, 10) || 500));
+    const ab = await getActiveBroker(req);
+    if (!ab) return res.status(401).json({ error: 'No active exchange' });
+    if (typeof ab.broker.getKlines !== 'function') {
+      return res.status(501).json({ error: `Klines proxy not implemented for ${ab.exchange}` });
+    }
+    const candles = await ab.broker.getKlines(ab.ctx, symbol, { interval, limit });
+    res.json({ exchange: ab.exchange, symbol, interval, candles: candles || [] });
+  } catch (error) {
+    logger.error('Error fetching klines', { message: error?.message });
+    res.status(502).json({ error: error?.message || 'Failed to fetch klines' });
+  }
+};

@@ -344,6 +344,57 @@ class MexcBroker extends IBroker {
       .filter(it => it.state === 0 && it.quoteCoin === 'USDT')
       .map(it => MexcBroker.toCanonicalSymbol(it.symbol));
   }
+
+  /**
+   * Historical klines via MEXC's public contract API. MEXC blocks browser
+   * CORS on this endpoint, so the frontend chart proxies through the backend.
+   * `interval` is passed through in MEXC notation (Min1/Min5/Hour4/Day1/...).
+   */
+  async getKlines(ctx, symbol, { interval, limit = 500 } = {}) {
+    const native = MexcBroker.toExchangeSymbol(symbol);
+    const sec = mexcIntervalSeconds(interval);
+    if (!sec) throw new Error(`Unsupported interval "${interval}"`);
+    const nowSec = Math.floor(Date.now() / 1000);
+    const startSec = Math.max(0, nowSec - sec * limit);
+    const r = await this._publicGet(
+      ctx.mode,
+      `/api/v1/contract/kline/${native}`,
+      'Get Klines',
+      { interval, start: startSec, end: nowSec },
+    );
+    const d = r?.data;
+    if (!d?.time?.length) return [];
+    const out = [];
+    for (let i = 0; i < d.time.length; i++) {
+      const t = Number(d.time[i]);
+      if (!Number.isFinite(t)) continue;
+      out.push({
+        t: t * 1000,
+        o: parseFloat(d.open[i]),
+        h: parseFloat(d.high[i]),
+        l: parseFloat(d.low[i]),
+        c: parseFloat(d.close[i]),
+        v: parseFloat((d.vol?.[i] ?? d.amount?.[i] ?? 0).toString()),
+      });
+    }
+    return out;
+  }
+}
+
+function mexcIntervalSeconds(label) {
+  switch (label) {
+    case 'Min1': return 60;
+    case 'Min5': return 300;
+    case 'Min15': return 900;
+    case 'Min30': return 1800;
+    case 'Min60': return 3600;
+    case 'Hour4': return 14400;
+    case 'Hour8': return 28800;
+    case 'Day1': return 86400;
+    case 'Week1': return 604800;
+    case 'Month1': return 2592000;
+    default: return null;
+  }
 }
 
 module.exports = MexcBroker;
