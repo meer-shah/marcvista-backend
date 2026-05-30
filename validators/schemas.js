@@ -138,7 +138,12 @@ const nonNegativeNum = z
 const leverageNum = z
   .union([z.string(), z.number()])
   .transform((v) => (typeof v === 'string' ? Number(v) : v))
-  .refine((n) => Number.isFinite(n) && n >= 1 && n <= 125, { message: 'Leverage must be between 1 and 125.' });
+  // Upper bound is a sanity check only — the real per-symbol max is enforced
+  // by the exchange + instrument leverageFilter. Bybit tops out ~100x but
+  // MEXC and others allow ~200x+, so a hard 125 wrongly rejected valid MEXC
+  // leverage ("Validation failed"). Keep a generous ceiling that still blocks
+  // obvious garbage.
+  .refine((n) => Number.isFinite(n) && n >= 1 && n <= 1000, { message: 'Leverage must be between 1 and 1000.' });
 
 const placeOrderSchema = z.object({
   symbol: z.string().trim().min(1).max(40),
