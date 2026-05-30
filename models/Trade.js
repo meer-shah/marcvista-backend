@@ -70,6 +70,14 @@ tradeSchema.index({ user: 1, source: 1, placedAt: -1 });
 tradeSchema.index({ user: 1, exchange: 1, placedAt: -1 });
 tradeSchema.index({ user: 1, exchange: 1, outcome: 1 });
 tradeSchema.index({ user: 1, tags: 1 });
-tradeSchema.index({ bybitClosedPnlId: 1 }, { unique: true, sparse: true });
+// Unique only for REAL closed-pnl ids (dedup the sync). A plain `sparse`
+// unique index still indexes docs whose field is present-but-null — and
+// `bybitClosedPnlId` defaults to null, so every Pending/Cancelled trade would
+// collide on the null key (E11000) and fail to persist. A partialFilterExpression
+// scoped to string values indexes only closed trades, leaving nulls unconstrained.
+tradeSchema.index(
+  { bybitClosedPnlId: 1 },
+  { unique: true, partialFilterExpression: { bybitClosedPnlId: { $type: 'string' } } }
+);
 
 module.exports = mongoose.model('Trade', tradeSchema);
