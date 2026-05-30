@@ -211,6 +211,12 @@ mongoose.connect(process.env.MONGO_URI, {
     } catch (err) {
       logger.error('Migration failed (continuing boot)', { message: err?.message });
     }
+    try {
+      const { migrateTradeIndex } = require('./scripts/migrate-trade-index');
+      await migrateTradeIndex();
+    } catch (err) {
+      logger.error('Trade index migration failed (continuing boot)', { message: err?.message });
+    }
     app.listen(process.env.PORT, () => {
       logger.info('server started', { port: process.env.PORT });
     });
