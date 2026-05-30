@@ -158,64 +158,58 @@ class MexcBroker extends IBroker {
   }
 
   async setLeverage(ctx, { symbol, buyLeverage, sellLeverage }) {
-    // MEXC's /position/change_leverage has two mutually-exclusive shapes
+    // MEXC stores leverage PER SIDE (long & short independently), so we ALWAYS
+    // fire two requests — one for the long side (positionType 1) and one for
+    // the short side (positionType 2) — both at the SAME leverage the user
+    // picked, so the symbol is uniformly levered regardless of trade direction.
+    //
+    // Per side, MEXC's /position/change_leverage has two shapes
     // (https://mexcdevelop.github.io/apidocs/contract_v1_en/#change-leverage):
-    //   - With an OPEN position → pass `positionId` + `leverage` only; MEXC
-    //     reuses the position's openType/positionType. Drive each open
-    //     position by id so both sides update.
-    //   - With NO open position → pass symbol + openType (1 isolated /
-    //     2 cross) + positionType (1 long / 2 short) + leverage. Long and
-    //     short have INDEPENDENT leverage, so call once per side, and fall
-    //     back to isolated when cross is rejected so isolated-margin accounts
-    //     work without manually flipping margin mode first.
-    // The previous build only ever sent { symbol, openType:2, positionType },
-    // which MEXC silently rejected whenever a position was open or the
-    // account was in isolated mode — so leverage never actually changed.
+    //   - That side has an OPEN position → must pass `positionId` + `leverage`
+    //     (MEXC reuses the position's openType/positionType).
+    //   - That side is FLAT → pass symbol + openType (1 isolated / 2 cross) +
+    //     positionType + leverage. We try cross first, then isolated, so
+    //     isolated-margin accounts work without flipping margin mode first.
     const native = MexcBroker.toExchangeSymbol(symbol);
-    const longLev = Number(buyLeverage);
-    const shortLev = Number(sellLeverage ?? buyLeverage);
+    // One leverage for both sides (user sets a single value; sellLeverage is
+    // accepted for API symmetry but defaults to the same number).
+    const lev = Number(buyLeverage ?? sellLeverage);
     const sideOk = (r) => r?.code === 0 || r?.success === true;
 
-    // 1) Open positions on this symbol → drive by positionId (per-side lev).
-    let openPositions = [];
+    // Map any open position to its side so we can drive it by positionId.
+    const openIdBySide = {}; // positionType (1|2) -> positionId
     try {
       const pr = await this._signedRequest(
         ctx, 'GET', '/api/v1/private/position/open_positions', 'Open Positions (for leverage)',
         { symbol: native },
       );
-      openPositions = (pr?.data || []).filter(p => p.positionId && parseFloat(p.holdVol) > 0);
+      for (const p of (pr?.data || [])) {
+        if (p.positionId && parseFloat(p.holdVol) > 0) openIdBySide[p.positionType] = p.positionId;
+      }
     } catch (err) {
       logger.warn('[MEXC] setLeverage: open_positions lookup failed', { message: err?.message });
     }
 
-    if (openPositions.length) {
-      const results = [];
-      let firstErr = null;
-      for (const p of openPositions) {
-        const lev = p.positionType === 2 ? shortLev : longLev;
+    // Set ONE side to `lev` (positionId form if that side has an open
+    // position, else symbol form with cross→isolated fallback).
+    const setSide = async (positionType) => {
+      const positionId = openIdBySide[positionType];
+      if (positionId) {
         try {
-          const r = await this._signedRequest(
+          return await this._signedRequest(
             ctx, 'POST', '/api/v1/private/position/change_leverage', 'Set Leverage',
-            { positionId: p.positionId, leverage: lev },
+            { positionId, leverage: lev },
           );
-          results.push(r);
-          if (!sideOk(r) && !firstErr) firstErr = r?.msg || r?.message || `code ${r?.code}`;
         } catch (err) {
-          firstErr = firstErr || err.message;
+          return { code: -1, msg: err?.message };
         }
       }
-      const ok = results.some(sideOk);
-      return { retCode: ok ? 0 : -1, retMsg: ok ? 'OK' : (firstErr || 'Set leverage failed'), _raw: results };
-    }
-
-    // 2) No open position → set both sides; try cross (2) then isolated (1).
-    const trySide = async (positionType, leverage) => {
       let last = null;
-      for (const openType of [2, 1]) {
+      for (const openType of [2, 1]) { // cross first, then isolated
         try {
           const r = await this._signedRequest(
             ctx, 'POST', '/api/v1/private/position/change_leverage', 'Set Leverage',
-            { symbol: native, leverage, openType, positionType },
+            { symbol: native, leverage: lev, openType, positionType },
           );
           if (sideOk(r)) return r;
           last = r;
@@ -226,8 +220,9 @@ class MexcBroker extends IBroker {
       return last || { code: -1, msg: 'rejected' };
     };
 
-    const longR = await trySide(1, longLev);
-    const shortR = await trySide(2, shortLev);
+    // Two requests: long side, then short side — both at the same leverage.
+    const longR = await setSide(1);
+    const shortR = await setSide(2);
     const longOk = sideOk(longR);
     const shortOk = sideOk(shortR);
     if (longOk && shortOk) {
@@ -236,7 +231,7 @@ class MexcBroker extends IBroker {
     const failMsg = (!longOk ? longR : shortR)?.msg || (!longOk ? longR : shortR)?.message || 'MEXC leverage change rejected';
     const partial = longOk || shortOk;
     const retMsg = partial
-      ? `${longOk ? 'Short' : 'Long'} leverage failed (${failMsg}). ${longOk ? 'Long' : 'Short'} side already updated — your account is now split-leverage. Retry to align both sides.`
+      ? `${longOk ? 'Short' : 'Long'} leverage failed (${failMsg}). ${longOk ? 'Long' : 'Short'} side updated — your account is now split-leverage. Retry to align both sides.`
       : `MEXC leverage change rejected: ${failMsg}`;
     return { retCode: -1, retMsg, _raw: [longR, shortR] };
   }
