@@ -1,25 +1,10 @@
 const { http_request, clearCredentialCache } = require('../config/bybitConfig');
-const { getBroker, getBrokerContext } = require('../services/brokers');
 const logger = require('../utils/logger');
 
-/**
- * Resolve the broker + ctx for the user's currently-active exchange.
- * Tolerant of missing user / missing credentials — caller may treat null
- * return as "show empty list" and surface a friendly error.
- */
-async function getActiveBrokerForUser(req) {
-  try {
-    const User = require('../models/User');
-    const user = await User.findById(req.user._id).select('activeExchange').lean();
-    const exchange = user?.activeExchange || 'bybit';
-    const broker = getBroker(exchange);
-    const ctx = await getBrokerContext(req.user._id, exchange);
-    return { broker, ctx, exchange };
-  } catch (err) {
-    logger.warn('getActiveBrokerForUser failed', { message: err?.message });
-    return null;
-  }
-}
+// Resolve the broker + ctx for the user's currently-active exchange.
+// Shared with controllers/symbolController.js via the extracted helper below
+// (same logic and log label as before).
+const { getActiveBrokerForUser } = require('../services/brokers/activeBroker');
 const {
   calculateTradeMetrics,
   findBestAndWorstTrade,

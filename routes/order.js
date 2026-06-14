@@ -1,5 +1,6 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = rateLimit;
 const orderController = require('../controllers/order');
 const fetchinfoController = require('../controllers/fetchinfo');
 const { authMiddleware } = require('../middleware/auth');
@@ -17,8 +18,11 @@ const router = express.Router();
 
 // Key on user ID when authenticated so users behind a shared NAT/office IP
 // don't share quota. Falls back to IP for the rare unauthenticated case
-// (these routes are auth-gated below, so it's belt-and-braces).
-const userOrIpKey = (req) => (req.user?._id ? String(req.user._id) : req.ip);
+// (these routes are auth-gated below, so it's belt-and-braces). The IP path
+// runs through express-rate-limit's ipKeyGenerator helper, which returns the
+// raw address for IPv4 (unchanged behavior) and a /56 group for IPv6 so a
+// single IPv6 client can't rotate addresses to bypass the limit.
+const userOrIpKey = (req) => (req.user?._id ? String(req.user._id) : ipKeyGenerator(req.ip));
 
 // Placing orders: 30 per 15 min — generous for active trading, blocks spam
 const placeOrderLimiter = rateLimit({

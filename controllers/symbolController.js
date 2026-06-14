@@ -1,23 +1,47 @@
-const { getBroker, getBrokerContext } = require('../services/brokers');
 const logger = require('../utils/logger');
 
 /**
  * Resolve the broker + ctx for the user's currently-active exchange.
- * Mirrors the helper in fetchinfo.js — duplicated here to avoid a cyclic
- * controller-to-controller import.
+ * Now backed by the shared services/brokers/activeBroker helper; the custom
+ * log label preserves this controller's original warning line.
  */
-async function getActiveBroker(req) {
-  try {
-    const User = require('../models/User');
-    const user = await User.findById(req.user._id).select('activeExchange').lean();
-    const exchange = user?.activeExchange || 'bybit';
-    const broker = getBroker(exchange);
-    const ctx = await getBrokerContext(req.user._id, exchange);
-    return { broker, ctx, exchange };
-  } catch (err) {
-    logger.warn('symbols: getActiveBroker failed', { message: err?.message });
-    return null;
-  }
+const { getActiveBrokerForUser } = require('../services/brokers/activeBroker');
+const getActiveBroker = (req) => getActiveBrokerForUser(req, 'symbols: getActiveBroker failed');
+
+/**
+ * Tiny TTL + in-flight cache for exchange MARKET METADATA (symbol list,
+ * instrument info). This data is user-independent — it only depends on
+ * (exchange, mode) — and changes on the order of minutes/hours, so caching it
+ * server-side collapses a ~1000-row exchange round-trip per request into one
+ * shared fetch. Mirrors the inflight+TTL pattern in newsController.js.
+ *
+ * Only successful, non-empty results are cached; failures fall through so the
+ * next request retries against the exchange. Transparent to callers.
+ */
+const SYMBOLS_TTL_MS = 10 * 60 * 1000;     // tradable-symbol set: new listings appear within ~10 min
+const INSTRUMENT_TTL_MS = 60 * 60 * 1000;  // qtyStep / tickSize / maxLeverage: effectively static
+const _cache = new Map();    // key -> { value, expiresAt }
+const _inflight = new Map(); // key -> Promise
+
+async function cachedFetch(key, ttlMs, producer) {
+  const now = Date.now();
+  const hit = _cache.get(key);
+  if (hit && hit.expiresAt > now) return hit.value;
+  const existing = _inflight.get(key);
+  if (existing) return existing;
+  const promise = (async () => {
+    const value = await producer();
+    return value;
+  })()
+    .then((value) => {
+      // Cache only meaningful results — never poison the cache with empty/null.
+      const isEmpty = value == null || (Array.isArray(value) && value.length === 0);
+      if (!isEmpty) _cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+      return value;
+    })
+    .finally(() => { _inflight.delete(key); });
+  _inflight.set(key, promise);
+  return promise;
 }
 
 /**
@@ -29,11 +53,15 @@ exports.getSymbols = async (req, res) => {
   try {
     const ab = await getActiveBroker(req);
     if (!ab) return res.status(401).json({ success: false, data: [], count: 0, error: 'No active exchange' });
-    const symbols = await ab.broker.listSymbols(ab.ctx);
+    const sorted = await cachedFetch(
+      `symbols:${ab.exchange}:${ab.ctx.mode}`,
+      SYMBOLS_TTL_MS,
+      async () => ((await ab.broker.listSymbols(ab.ctx)) || []).sort(),
+    );
     res.status(200).json({
       success: true,
-      data: (symbols || []).sort(),
-      count: (symbols || []).length,
+      data: sorted,
+      count: sorted.length,
       source: ab.exchange,
     });
   } catch (error) {
@@ -53,7 +81,11 @@ exports.getInstrumentInfo = async (req, res) => {
     if (!symbol) return res.status(400).json({ error: 'symbol required' });
     const ab = await getActiveBroker(req);
     if (!ab) return res.status(401).json({ error: 'No active exchange' });
-    const info = await ab.broker.getInstrumentInfo(ab.ctx, symbol);
+    const info = await cachedFetch(
+      `instrument:${ab.exchange}:${ab.ctx.mode}:${symbol}`,
+      INSTRUMENT_TTL_MS,
+      () => ab.broker.getInstrumentInfo(ab.ctx, symbol),
+    );
     if (!info) return res.status(404).json({ error: 'Symbol not found on this exchange' });
     res.json({ ...info, exchange: ab.exchange });
   } catch (error) {

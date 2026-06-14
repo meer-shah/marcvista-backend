@@ -66,6 +66,9 @@ const tradeSchema = new Schema({
 
 tradeSchema.index({ user: 1, riskProfile: 1, placedAt: -1 });
 tradeSchema.index({ user: 1, symbol: 1, outcome: 1 });
+// Aligns with portfolioService.getMyTrades sort { outcome:1, closedAt:-1, placedAt:-1 }
+// so Mongo serves it from the index instead of an in-memory blocking sort.
+tradeSchema.index({ user: 1, outcome: 1, closedAt: -1, placedAt: -1 });
 tradeSchema.index({ user: 1, source: 1, placedAt: -1 });
 tradeSchema.index({ user: 1, exchange: 1, placedAt: -1 });
 tradeSchema.index({ user: 1, exchange: 1, outcome: 1 });

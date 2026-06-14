@@ -8,7 +8,7 @@ const { validateBody } = require('../middleware/validate');
 const { registerSchema, loginSchema } = require('../validators/schemas');
 const logger = require('../utils/logger');
 const { writeAuditLog } = require('../utils/audit');
-const { generateToken: generateCsrfToken } = require('../utils/csrf');
+const { generateToken: generateCsrfToken, getRequestUserId } = require('../utils/csrf');
 
 const isProduction = process.env.NODE_ENV === 'production';
 const authCookieOptions = {
@@ -32,7 +32,12 @@ const authLimiter = rateLimit({
 });
 
 router.get('/csrf-token', (req, res) => {
-  res.json({ csrfToken: generateCsrfToken() });
+  // Bind the issued token to the requester's user when they are authenticated
+  // (HttpOnly cookie or Bearer present). Pre-login callers get an anonymous
+  // token, which is only accepted on unauthenticated state-changing routes
+  // (login/register). See utils/csrf.js for the binding rationale.
+  const userId = getRequestUserId(req);
+  res.json({ csrfToken: generateCsrfToken(userId) });
 });
 
 // Register new user
@@ -149,6 +154,11 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
 // Logout (invalidate token)
 router.post('/logout', optionalAuth, async (req, res) => {
   try {
+    // Always emit the cookie-clear header, even when the token was already
+    // invalidated (duplicate logout / prior multi-device logout) — preserves
+    // the pre-hardening behaviour where Set-Cookie clear was unconditional.
+    res.clearCookie('authToken', authCookieOptions);
+
     if (!req.user) {
       return res.json({ message: 'Already logged out (no active session).' });
     }
@@ -156,7 +166,6 @@ router.post('/logout', optionalAuth, async (req, res) => {
     if (req.authToken) {
       await req.user.removeAuthToken(req.authToken);
     }
-    res.clearCookie('authToken', authCookieOptions);
 
     writeAuditLog({ event: 'logout', userId: req.user._id, req });
 

@@ -22,8 +22,10 @@ const authMiddleware = async (req, res, next) => {
       return res.status(401).json({ message: 'Authentication required. No token provided.' });
     }
 
-    // Verify token — JWT_SECRET is guaranteed present by server startup check
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    // Verify token — JWT_SECRET is guaranteed present by server startup check.
+    // Pin the algorithm to HS256 (the only one we ever sign with) so the
+    // verifier can't be coerced into accepting another algorithm class.
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
 
     const user = await User.findById(decoded.userId);
     if (!user) {
@@ -56,9 +58,13 @@ const optionalAuth = async (req, res, next) => {
   try {
     const token = getTokenFromRequest(req);
     if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
       const user = await User.findById(decoded.userId);
-      if (user) {
+      // Enforce the same logout/rotation allow-list that authMiddleware does:
+      // a token must still live in user.tokens to count as a live session.
+      // Without this, a logged-out (or forged) token is trusted on every
+      // optionalAuth route (/me, /logout) even though it fails on real routes.
+      if (user && user.tokens.some(t => t.token === token)) {
         req.user = user;
         req.authToken = token;
       }

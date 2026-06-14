@@ -1,6 +1,6 @@
 /**
  * BybitBroker — concrete implementation of IBroker for the Bybit V5 API.
- * See interfaces/IBroker.js for the full contract.
+ * See services/brokers/IBroker.js for the full contract.
  *
  * All exchange I/O is isolated here. OrderService depends on this adapter
  * via constructor injection, making it easy to swap in a mock for tests.

@@ -93,14 +93,14 @@ userSchema.methods.generateAuthToken = function() {
   const token = jwt.sign(
     { userId: this._id, email: this.email },
     process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRE || '7d' }
+    { expiresIn: process.env.JWT_EXPIRE || '7d', algorithm: 'HS256' }
   );
 
   // Purge expired tokens — verify each stored token against JWT_SECRET,
   // drop ones that no longer verify (expired or otherwise invalid).
   this.tokens = this.tokens.filter(t => {
     try {
-      jwt.verify(t.token, process.env.JWT_SECRET);
+      jwt.verify(t.token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
       return true;
     } catch {
       return false;

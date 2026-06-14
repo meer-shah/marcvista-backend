@@ -41,7 +41,9 @@ const logger = {
     if (error?.code !== undefined)   safe.code   = error.code;
     if (error?.name)                 safe.type   = error.name;
     if (error?.status !== undefined) safe.status = error.status;
-    // Temporarily include error message for debugging
+    // NOTE: error.message is intentionally surfaced for debugging. The header
+    // contract advises against it (messages can carry secrets/PII) — revisit
+    // before production and drop this line to honor that contract.
     if (error?.message)              safe.message = error.message;
     // Deliberately omit: error.stack, error.response, request data
     emit('error', message, safe);

@@ -7,6 +7,7 @@ require('dotenv').config({ path: path.join(__dirname, envFile) });
 const Sentry = require('@sentry/node');
 const logger = require('./utils/logger');
 const cors = require('cors');
+const compression = require('compression');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
 const { csrfMiddleware } = require('./utils/csrf');
@@ -142,6 +143,12 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Handle all preflight requests explicitly
 
+// Gzip/deflate response compression. The polled JSON payloads (my-trades,
+// closed-pnl, portfolio-summary, symbols) are large and go out every few
+// seconds, so compressing them is a near-free latency win. Transparent to
+// clients — they negotiate via Accept-Encoding.
+app.use(compression());
+
 // Body parsing — 10kb for most routes; profile route accepts up to 3mb for base64 images
 app.use((req, res, next) => {
   const limit = req.path === '/api/auth/profile' ? '3mb' : '10kb';
@@ -196,6 +203,7 @@ app.use((req, res) => {
 });
 
 // Connect to MongoDB then start listening
+let server;
 mongoose.connect(process.env.MONGO_URI, {
   maxPoolSize: 50,      // max concurrent connections in the pool
   minPoolSize: 5,       // keep at least 5 connections warm
@@ -217,7 +225,7 @@ mongoose.connect(process.env.MONGO_URI, {
     } catch (err) {
       logger.error('Trade index migration failed (continuing boot)', { message: err?.message });
     }
-    app.listen(process.env.PORT, () => {
+    server = app.listen(process.env.PORT, () => {
       logger.info('server started', { port: process.env.PORT });
     });
   })
@@ -229,6 +237,12 @@ mongoose.connect(process.env.MONGO_URI, {
 // Graceful shutdown — close Mongoose cleanly
 const shutdown = async (signal) => {
   logger.info('shutdown signal received', { signal });
+  // Stop accepting new connections and let in-flight requests drain before
+  // tearing down the DB connection. Skip straight to disconnect if the HTTP
+  // server never came up (e.g. shutdown during boot).
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+  }
   await mongoose.disconnect();
   process.exit(0);
 };

@@ -16,10 +16,12 @@ const { classifyFillType, computeFeeAwareQty, effectiveRR, feeRatesFor, TAKER_FE
 const { getBroker, getBrokerContext } = require('./brokers');
 const logger = require('../utils/logger');
 
-// Legacy default broker sentinel — distinguishes "no broker injected, use
-// factory" from "test passed in a mock broker, use that".
-const LegacyBybitBroker = require('./BybitBroker');
-const DEFAULT_BROKER = new LegacyBybitBroker();
+// Default-broker sentinel — distinguishes "no broker injected, use the
+// per-user factory" from "test passed in a mock broker, use that". A unique
+// Symbol avoids constructing a throwaway broker instance just to act as a
+// marker; runtime behavior is identical (production does `new OrderService()`
+// with no arg, so _brokerInjected is false and the factory path is used).
+const DEFAULT_BROKER = Symbol('OrderService.defaultBroker');
 
 class OrderService {
   /**

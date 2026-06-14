@@ -21,8 +21,55 @@ const logger = require('../../utils/logger');
 
 const REAL_BASE = 'https://api.bybit.com';
 const DEMO_BASE = 'https://api-demo.bybit.com';
-const RECV_WINDOW = '5000';
+// Widened from 5000ms: signed requests from high-latency networks (overseas
+// → Bybit is ~200ms–1s here) need headroom so a slow round-trip doesn't push
+// the timestamp outside the window. Clock skew is handled separately by the
+// server-time sync below; recv_window only needs to cover network latency.
+const RECV_WINDOW = '10000';
 const HTTP_TIMEOUT = 8000;
+
+// Bybit rejects any signed request whose timestamp is outside recv_window of
+// ITS server clock with retCode 10002. Local machine clocks drift (observed
+// ~9s behind here), which silently zeroed out balance/positions/orders. We
+// sync to Bybit's server time once per TTL and apply the offset to every
+// signed request's timestamp, making auth immune to local clock skew.
+const TIME_SYNC_TTL_MS = 5 * 60 * 1000;
+const _timeOffset = {
+  real: { ms: 0, syncedAt: 0 },
+  demo: { ms: 0, syncedAt: 0 },
+};
+
+async function getServerTimeOffset(baseUrl, key) {
+  const slot = _timeOffset[key];
+  const now = Date.now();
+  if (slot.syncedAt && now - slot.syncedAt < TIME_SYNC_TTL_MS) return slot.ms;
+  try {
+    const t0 = Date.now();
+    const res = await axios.get(`${baseUrl}/v5/market/time`, { timeout: HTTP_TIMEOUT });
+    const t1 = Date.now();
+    const serverMs = Number(res.data?.time)
+      || Math.round(Number(res.data?.result?.timeNano) / 1e6);
+    if (Number.isFinite(serverMs) && serverMs > 0) {
+      // Estimate local time at the instant the server stamped its reply
+      // (midpoint of the round-trip) so the offset isn't biased by latency.
+      const localMidpoint = t0 + (t1 - t0) / 2;
+      slot.ms = Math.round(serverMs - localMidpoint);
+      slot.syncedAt = now;
+      if (Math.abs(slot.ms) > 1000) {
+        logger.warn('[Bybit] local clock skew detected, applying server-time offset', {
+          mode: key, offsetMs: slot.ms,
+        });
+      }
+    }
+  } catch (err) {
+    // Fall back to the last known offset (or 0). A failed sync must not block
+    // the actual request — worst case we're back to local-clock behavior.
+    logger.warn('[Bybit] server-time sync failed, using last known offset', {
+      mode: key, offsetMs: slot.ms, message: err?.message,
+    });
+  }
+  return slot.ms;
+}
 
 // Per-symbol fee overrides for cases where /v5/account/fee-rate doesn't
 // return useful data — primarily Bybit demo (api-demo.bybit.com), which
@@ -50,7 +97,9 @@ class BybitBroker extends IBroker {
   async _signedRequest(ctx, method, endpoint, info, payload) {
     const { apiKey, secret } = await getExchangeCredentials(ctx.userId, 'bybit');
     const baseUrl = this._baseUrl(ctx.mode);
-    const timestamp = Date.now().toString();
+    const modeKey = ctx.mode === 'real' ? 'real' : 'demo';
+    const offset = await getServerTimeOffset(baseUrl, modeKey);
+    const timestamp = (Date.now() + offset).toString();
     const isGet = method === 'GET';
     // Accept payload as either a pre-formatted query string (legacy callers)
     // OR a plain object (preferred). Object → URLSearchParams. JavaScript
@@ -80,7 +129,18 @@ class BybitBroker extends IBroker {
           ...(isGet ? {} : { 'Content-Type': 'application/json' }),
         },
       });
-      logger.info('bybit request succeeded', { info, method, endpoint, status: res.status, retCode: res.data?.retCode });
+      // HTTP 200 from Bybit does NOT mean the API call succeeded — a non-zero
+      // retCode (e.g. 10002 timestamp/recv_window, 10003 invalid key) is an
+      // application error carried inside a 200 response. Logging these as
+      // "succeeded" previously masked a clock-skew outage; surface them as warn.
+      const retCode = res.data?.retCode;
+      if (retCode !== 0) {
+        logger.warn('[Bybit] request returned API error', {
+          info, method, endpoint, status: res.status, retCode, retMsg: res.data?.retMsg,
+        });
+      } else {
+        logger.info('bybit request succeeded', { info, method, endpoint, status: res.status, retCode });
+      }
       return res.data;
     } catch (err) {
       const raw = err.response?.data || err.message;
