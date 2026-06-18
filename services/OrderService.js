@@ -318,6 +318,9 @@ class OrderService {
           balanceBefore: usdtBalance,
           feeMode,
           feeReserveUsd,
+          // Lock in the effective (fee-inclusive) R:R computed above so the
+          // portfolio table can show it without re-deriving the fee math.
+          effectiveRR: Number.isFinite(effRR) ? +effRR.toFixed(4) : null,
           orderLinkId,
           bybitOrderId: result?.result?.orderId || null,
           outcome: 'Pending',

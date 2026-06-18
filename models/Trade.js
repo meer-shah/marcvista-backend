@@ -38,6 +38,11 @@ const tradeSchema = new Schema({
   fees: { type: Number, default: null },
   feeMode: { type: String, enum: ['maker', 'taker'], default: null }, // predicted at order time
   feeReserveUsd: { type: Number, default: null }, // fee budget reserved at order time
+  // Effective (fee-inclusive) reward:risk locked in at order time — net reward
+  // after entry + exit fees over the staked risk, using the predicted fill
+  // mode. Stored so the portfolio / breakdown tables read it directly instead
+  // of re-deriving it client-side. Scalar, e.g. 1.85 means 1:1.85.
+  effectiveRR: { type: Number, default: null },
   duration: { type: Number, default: null }, // milliseconds between place and close
   outcome: {
     type: String,
